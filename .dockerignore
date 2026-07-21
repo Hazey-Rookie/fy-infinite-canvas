@@ -1,0 +1,13 @@
+.git
+.gitignore
+.DS_Store
+__pycache__/
+*.py[cod]
+*.log
+python/
+packages/
+node_modules/
+API/
+data/
+output/
+assets/
