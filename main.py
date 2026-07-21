@@ -175,6 +175,7 @@ class ConnectionManager:
 manager = ConnectionManager()
 GLOBAL_LOOP = None
 APP_VERSION = "2026.06.03"
+FY_REPO_URL = "https://github.com/chuanLL/fy-infinite-canvas"
 GITHUB_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION"
 GITHUB_TREE_URL = "https://api.github.com/repos/hero8152/Infinite-Canvas/git/trees/main?recursive=1"
@@ -1510,6 +1511,16 @@ def current_app_version():
     except Exception:
         return ""
 
+def current_fy_version():
+    version_file = os.path.join(BASE_DIR, "FY_VERSION")
+    try:
+        if os.path.exists(version_file):
+            with open(version_file, "r", encoding="utf-8") as f:
+                return (f.read().strip().splitlines() or [""])[0].strip()
+    except Exception:
+        pass
+    return ""
+
 def update_notes_path() -> str:
     return os.path.join(STATIC_DIR, "update-notes.json")
 
@@ -1781,6 +1792,9 @@ def app_info():
     version = current_app_version()
     return {
         "version": version,
+        "upstream_version": version,
+        "fy_version": current_fy_version(),
+        "fy_repo_url": FY_REPO_URL,
         "repo_url": GITHUB_REPO_URL,
         "version_url": GITHUB_VERSION_URL,
         "tree_url": GITHUB_TREE_URL,
