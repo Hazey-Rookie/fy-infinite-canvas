@@ -8,6 +8,7 @@ const idInput = document.getElementById('idInput');
 const baseInput = document.getElementById('baseInput');
 const protocolInput = document.getElementById('protocolInput');
 const imageRequestModeInput = document.getElementById('imageRequestModeInput');
+const imageSizePolicyInput = document.getElementById('imageSizePolicyInput');
 const imageEditRouteInput = document.getElementById('imageEditRouteInput');
 const keyInput = document.getElementById('keyInput');
 const keyHint = document.getElementById('keyHint');
@@ -84,8 +85,8 @@ const LINGJING_REGISTER_URL = 'https://apistudio.vip/register?aff=g1CT';
 const VIP_GPT_DEFAULT_BASE_URL = 'https://www.vip-gpt.net';
 const VIP_GPT_REGISTER_URL = 'https://www.vip-gpt.net/vip-gpt/register?aff=YGMS7BDKNY5Y';
 const EXAMPLE_BASE_URL = 'https://api.example.com/v1';
-const JIMENG_DEFAULT_IMAGE_MODELS = ['5.0', '4.6', '4.5', '4.1', '4.0', '3.1', '3.0'];
-const JIMENG_DEFAULT_VIDEO_MODELS = ['seedance2.0fast_vip', 'seedance2.0_vip'];
+const JIMENG_DEFAULT_IMAGE_MODELS = ['5.0Pro', '5.0', '4.7', '4.6', '4.5', '4.1', '4.0', '3.1', '3.0'];
+const JIMENG_DEFAULT_VIDEO_MODELS = ['seedance2.0fast_vip', 'seedance2.0_vip', 'seedance2.0', 'seedance2.0fast', 'seedance2.0mini'];
 const JIMENG_LEGACY_IMAGE_MODELS = new Set(['jimeng-image-2k', 'jimeng-image-4k']);
 const JIMENG_LEGACY_VIDEO_MODELS = new Set(['jimeng-video-720p', 'jimeng-video-1080p']);
 const CODEX_DEFAULT_IMAGE_MODELS = ['gpt-image-2'];
@@ -93,7 +94,7 @@ const CODEX_DEFAULT_CHAT_MODELS = ['gpt-5.5'];
 const GEMINI_CLI_DEFAULT_IMAGE_MODELS = ['auto'];
 const GEMINI_CLI_DEFAULT_CHAT_MODELS = ['auto'];
 const CLI_PROTOCOLS = new Set(['jimeng', 'codex', 'gemini-cli']);
-const API_PROTOCOLS = ['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng', 'codex', 'gemini-cli'];
+const API_PROTOCOLS = ['openai', 'apimart', 'gemini', 'grok', 'volcengine', 'runninghub', 'jimeng', 'codex', 'gemini-cli'];
 const CLI_PROVIDER_PRESETS = {
     jimeng:{id:'jimeng', name:'即梦 CLI', protocol:'jimeng'},
     codex:{id:'codex', name:'GPT CLI', protocol:'codex'},
@@ -153,6 +154,23 @@ let recommendInlineOpen = false;
 let providerDragId = '';
 // category: 'allround'（全能）| 'value'（性价比）| 'free'（免费），推荐面板按分组分节展示
 const RECOMMENDED_APIS = [
+    {
+        id:'tudou',
+        name:'土豆API',
+        category:'value',
+        base_url:'https://api.ai-tudou.net',
+        protocol:'openai',
+        image_request_mode:'openai',
+        register_url:'https://api.ai-tudou.net/register?aff=GmBu',
+        tagKeys:['api.tagImageModels','api.tagVideoModels','api.tagLlmModels'],
+        icons:['IMG','VID','LLM'],
+        summaryKey:'api.recommendTudouSummary',
+        advantages:['OpenAI 兼容接入', '支持 LLM、图像和视频模型', 'Gemini 模型已预设 Gemini 协议'],
+        image_models:['gpt-image-2', 'gpt-image-2-1k', 'gpt-image-2-2k', 'gpt-image-2-4k', 'gemini-3.1-flash-image-preview', 'gemini-3-pro-image-preview'],
+        chat_models:['gpt-5.5'],
+        video_models:[],
+        model_protocols:{'gemini-3.1-flash-image-preview':'gemini', 'gemini-3-pro-image-preview':'gemini'}
+    },
     {
         id:'exellome',
         name:'EXELLOME',
@@ -284,39 +302,10 @@ const RECOMMEND_GROUPS = [
     {key:'value', titleKey:'api.recommendGroupValue', icon:'badge-percent'},
     {key:'free', titleKey:'api.recommendGroupFree', icon:'gift'}
 ];
-const LOCKED_RECOMMENDED_PROTOCOL_IDS = new Set(['exellome', 'fhl']);
-function lockedRecommendedApi(itemOrId){
-    const id = typeof itemOrId === 'string' ? itemOrId : itemOrId?.id;
-    const name = typeof itemOrId === 'string' ? '' : itemOrId?.name;
-    const baseUrl = typeof itemOrId === 'string' ? '' : itemOrId?.base_url;
-    const normalizedId = String(id || '').trim().toLowerCase();
-    const normalizedName = String(name || '').trim().toLowerCase();
-    const normalizedBase = String(baseUrl || '').trim().replace(/\/+$/, '').toLowerCase();
-    const normalizedHost = (() => {
-        try { return new URL(normalizedBase).host.toLowerCase(); } catch(e) { return ''; }
-    })();
-    return RECOMMENDED_APIS.find(api => {
-        if(!LOCKED_RECOMMENDED_PROTOCOL_IDS.has(api.id)) return false;
-        const apiBase = String(api.base_url || '').trim().replace(/\/+$/, '').toLowerCase();
-        const apiHost = (() => {
-            try { return new URL(apiBase).host.toLowerCase(); } catch(e) { return ''; }
-        })();
-        return normalizedId === api.id
-            || normalizedName === String(api.name || '').trim().toLowerCase()
-            || (apiBase && normalizedBase === apiBase)
-            || (apiHost && normalizedHost === apiHost);
-    }) || null;
-}
-function hasLockedRecommendedProtocol(itemOrId){
-    return Boolean(lockedRecommendedApi(itemOrId));
-}
-function applyLockedRecommendedProtocol(item){
-    const api = lockedRecommendedApi(item);
-    if(!item || !api) return false;
-    item.protocol = String(api.protocol || 'openai').toLowerCase();
-    item.image_request_mode = normalizeImageRequestMode(api.image_request_mode);
-    return true;
-}
+const LOCKED_RECOMMENDED_PROTOCOL_IDS = new Set();
+function lockedRecommendedApi(){ return null; }
+function hasLockedRecommendedProtocol(){ return false; }
+function applyLockedRecommendedProtocol(){ return false; }
 
 function refreshIcons(){ if(window.lucide) lucide.createIcons(); }
 function tr(key){ return window.StudioI18n ? window.StudioI18n.t(key) : key; }
@@ -328,11 +317,30 @@ function trf(key, vars={}){
     return text;
 }
 function setStatus(text){ statusEl.textContent = text || ''; }
-function broadcastStudioApiChange(type='providers-changed'){
-    const message = { type, updated_at:Date.now() };
-    try { new BroadcastChannel('studio-api').postMessage(message); } catch(e) {}
+let studioApiBroadcastChannel = null;
+let studioApiBroadcastTimer = 0;
+let studioApiBroadcastTypes = new Set();
+const studioApiBroadcastSource = `api-settings-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+function emitStudioApiChange(type){
+    const message = { type, updated_at:Date.now(), source:studioApiBroadcastSource };
+    try {
+        studioApiBroadcastChannel = studioApiBroadcastChannel || new BroadcastChannel('studio-api');
+        studioApiBroadcastChannel.postMessage(message);
+    } catch(e) {}
     try { window.parent?.postMessage(message, '*'); } catch(e) {}
-    try { window.top?.postMessage(message, '*'); } catch(e) {}
+    if(window.top && window.top !== window.parent) {
+        try { window.top.postMessage(message, '*'); } catch(e) {}
+    }
+}
+function broadcastStudioApiChange(type='providers-changed'){
+    studioApiBroadcastTypes.add(type);
+    if(studioApiBroadcastTimer) clearTimeout(studioApiBroadcastTimer);
+    studioApiBroadcastTimer = setTimeout(() => {
+        const types = Array.from(studioApiBroadcastTypes);
+        studioApiBroadcastTypes.clear();
+        studioApiBroadcastTimer = 0;
+        types.forEach(emitStudioApiChange);
+    }, 120);
 }
 function rhEditorSideScrollEl(){
     return rhWorkflowEditorNodeList?.closest?.('.rh-workflow-editor-side') || rhWorkflowEditorNodeList;
@@ -800,6 +808,7 @@ function syncEditor(){
             ? lockedApi.image_request_mode
             : (imageRequestModeInput?.value || item.image_request_mode)
     );
+    item.image_size_policy = normalizeImageSizePolicy(imageSizePolicyInput?.value || item.image_size_policy);
     item.image_edit_route = normalizeImageEditRoute(
         item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || CLI_PROTOCOLS.has(selectedProtocol)
             ? 'general'
@@ -2495,6 +2504,10 @@ function renderEditor(){
         imageRequestModeInput.disabled = Boolean(lockedApi) || item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || CLI_PROTOCOLS.has(String(protocolInput?.value || item.protocol || '').toLowerCase());
         imageRequestModeInput.title = lockedApi ? '推荐平台使用固定图片协议' : '';
     }
+    if(imageSizePolicyInput){
+        imageSizePolicyInput.value = normalizeImageSizePolicy(item.image_size_policy);
+        imageSizePolicyInput.disabled = item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || ['jimeng', 'gemini-cli'].includes(String(protocolInput?.value || item.protocol || '').toLowerCase());
+    }
     if(imageEditRouteInput){
         imageEditRouteInput.value = normalizeImageEditRoute(item.image_edit_route);
         imageEditRouteInput.disabled = item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || CLI_PROTOCOLS.has(String(protocolInput?.value || item.protocol || '').toLowerCase());
@@ -2870,7 +2883,11 @@ function currentProviderApiKey(item){
 }
 function normalizeImageRequestMode(value){
     const mode = String(value || '').trim().toLowerCase();
-    return ['openai', 'openai-json', 'openai-video-proxy', 'openai-responses'].includes(mode) ? mode : 'openai';
+    return ['openai', 'openai-json', 'openai-video-proxy', 'openai-responses', 'openai-async-image'].includes(mode) ? mode : 'openai';
+}
+function normalizeImageSizePolicy(value){
+    const policy = String(value || '').trim().toLowerCase();
+    return ['auto', 'openai', 'passthrough'].includes(policy) ? policy : 'auto';
 }
 function normalizeImageEditRoute(value){
     const route = String(value || '').trim().toLowerCase();
@@ -2881,6 +2898,7 @@ function imageRequestModeLabel(mode){
     if(normalized === 'openai-json') return 'OpenAI JSON';
     if(normalized === 'openai-video-proxy') return 'OpenAI 中转';
     if(normalized === 'openai-responses') return 'OpenAI RS';
+    if(normalized === 'openai-async-image') return 'OpenAI 异步图片';
     return 'OpenAI 标准';
 }
 function isRunningHubContext(item, baseUrl=''){
@@ -3008,7 +3026,7 @@ async function probeAsync(){
         const detectedProtocol = String(data.protocol || '').toLowerCase();
         const isAsync = data.ok === true && detectedProtocol === 'apimart';
         const isOpenAiCompat = data.ok === true && detectedProtocol === 'openai';
-        const keepManualProtocol = ['gemini', 'volcengine', 'jimeng', 'codex', 'gemini-cli'].includes(currentProtocol);
+        const keepManualProtocol = ['gemini', 'grok', 'volcengine', 'jimeng', 'codex', 'gemini-cli'].includes(currentProtocol);
         if(protocolInput && !keepManualProtocol){
             applyDetectedProtocol(detectedProtocol || (isAsync ? 'apimart' : 'openai'));
         }
@@ -3025,7 +3043,7 @@ async function probeAsync(){
                 : detectedProtocol === 'openai'
                     ? 'OpenAI 兼容'
                     : keepManualProtocol
-                    ? (currentProtocol === 'gemini' ? 'Gemini' : currentProtocol.toUpperCase())
+                    ? (currentProtocol === 'gemini' ? 'Gemini' : currentProtocol === 'grok' ? 'Grok' : currentProtocol.toUpperCase())
                     : 'OpenAI 兼容';
         showVerifyResult(`
             ${hideTasksEndpointTip ? '' : `<div style="font-size:11px;font-weight:800;color:${color}">${icon} ${escapeHtml(probeMessage)}</div>`}
@@ -3035,7 +3053,7 @@ async function probeAsync(){
                 <pre style="margin-top:6px;padding:10px 12px;border-radius:10px;background:var(--soft);border:1px solid var(--line-2);font-size:10.5px;font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-all;color:var(--text);max-height:200px;overflow:auto">${escapeHtml(rawJson)}</pre>
             </details>`);
     } catch(e){
-        const keepManualProtocol = ['gemini', 'volcengine', 'jimeng', 'codex', 'gemini-cli'].includes(String(protocolInput?.value || item.protocol || '').toLowerCase());
+        const keepManualProtocol = ['gemini', 'grok', 'volcengine', 'jimeng', 'codex', 'gemini-cli'].includes(String(protocolInput?.value || item.protocol || '').toLowerCase());
         if(protocolInput && !keepManualProtocol){ protocolInput.value = 'openai'; protocolInput.dispatchEvent(new Event('change')); }
         const suffix = keepManualProtocol ? '，已保留当前手动选择的协议' : '，协议已设为 OpenAI 兼容';
         showVerifyResult(`<div style="font-size:11px;font-weight:800;color:#b45309">⚠ ${escapeHtml(e.message || String(e))}${suffix}</div>`);
@@ -3394,9 +3412,10 @@ function providerSupportsModelProtocol(item){
     return Boolean(item) && !FIXED_PROTOCOL_PROVIDER_IDS.has(item.id);
 }
 function modelProtocolSelectHtml(kind, index, model, item){
-    if(kind === 'video' || !providerSupportsModelProtocol(item)) return '';
+    if(!providerSupportsModelProtocol(item)) return '';
+    if(kind === 'video') return '';
     const map = (item.model_protocols && typeof item.model_protocols === 'object') ? item.model_protocols : {};
-    const current = String(map[String(model || '').trim()] || '').toLowerCase();
+    let current = String(map[String(model || '').trim()] || '').toLowerCase();
     const opt = (val, label) => `<option value="${val}" ${current === val ? 'selected' : ''}>${label}</option>`;
     return `<select class="model-protocol-select" title="该模型使用的协议，默认跟随平台全局协议" onchange="updateModelProtocol('${kind}', ${index}, this.value)">
         <option value="" ${current === '' ? 'selected' : ''}>默认</option>
@@ -3517,7 +3536,7 @@ function addProvider(){
     let id = 'custom-api';
     let index = 2;
     while(providers.some(item => item.id === id)) id = `custom-api-${index++}`;
-    providers.push({id, name:'API', base_url:'', protocol:'openai', image_request_mode:'openai', image_edit_route:'general', image_generation_endpoint:'', image_edit_endpoint:'', enabled:true, primary:false, image_models:[], chat_models:[], video_models:[], has_key:false, key_preview:''});
+    providers.push({id, name:'API', base_url:'', protocol:'openai', image_request_mode:'openai', image_size_policy:'auto', image_edit_route:'general', image_generation_endpoint:'', image_edit_endpoint:'', enabled:true, primary:false, image_models:[], chat_models:[], video_models:[], has_key:false, key_preview:''});
     selectedId = id;
     renderEditor();
 }
@@ -3537,6 +3556,7 @@ async function addCliProvider(kind){
             base_url:'',
             protocol:preset.protocol,
             image_request_mode:'openai',
+            image_size_policy:'auto',
             image_edit_route:'general',
             image_generation_endpoint:'',
             image_edit_endpoint:'',
@@ -3643,6 +3663,31 @@ function modelProtocolStillUsed(item, name){
     const lists = ['image_models', 'chat_models', 'video_models'];
     return lists.some(k => Array.isArray(item[k]) && item[k].includes(name));
 }
+function sanitizeModelProtocols(item){
+    const source = (item?.model_protocols && typeof item.model_protocols === 'object') ? item.model_protocols : {};
+    const imageChatModels = new Set([...(item?.image_models || []), ...(item?.chat_models || [])].map(model => String(model || '').trim()).filter(Boolean));
+    const out = {};
+    Object.entries(source).forEach(([rawName, rawProto]) => {
+        const name = String(rawName || '').trim();
+        const proto = String(rawProto || '').trim().toLowerCase();
+        if(!name) return;
+        if(imageChatModels.has(name) && (proto === 'openai' || proto === 'gemini')){
+            out[name] = proto;
+        }
+    });
+    return out;
+}
+function applyAutoModelProtocols(item){
+    if(!providerSupportsModelProtocol(item)) return;
+    if(!item.model_protocols || typeof item.model_protocols !== 'object') item.model_protocols = {};
+    [...(item.image_models || []), ...(item.chat_models || [])].forEach(model => {
+        const name = String(model || '').trim();
+        if(!name) return;
+        if(name.toLowerCase().includes('gemini') && !item.model_protocols[name]){
+            item.model_protocols[name] = 'gemini';
+        }
+    });
+}
 function updateModel(kind, index, value){
     const item = provider();
     const key = kind === 'image' ? 'image_models' : kind === 'video' ? 'video_models' : 'chat_models';
@@ -3678,7 +3723,7 @@ function updateModelProtocol(kind, index, value){
     if(!name) return;
     if(!item.model_protocols || typeof item.model_protocols !== 'object') item.model_protocols = {};
     const proto = String(value || '').trim().toLowerCase();
-    if(proto === 'openai' || proto === 'gemini'){
+    if(kind !== 'video' && (proto === 'openai' || proto === 'gemini')){
         item.model_protocols[name] = proto;
     } else {
         delete item.model_protocols[name];
@@ -3728,6 +3773,7 @@ async function saveProviders(){
                 ? 'openai'
                 : item.image_request_mode
         );
+        item.image_size_policy = normalizeImageSizePolicy(item.image_size_policy);
         item.image_edit_route = normalizeImageEditRoute(
             item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || isCliProtocol
                 ? 'general'
@@ -3745,6 +3791,8 @@ async function saveProviders(){
         item.image_models = unique(item.image_models || []);
         item.chat_models = unique(item.chat_models || []);
         item.video_models = unique(item.video_models || []);
+        applyAutoModelProtocols(item);
+        item.model_protocols = sanitizeModelProtocols(item);
         const modelNameSource = (item.model_names && typeof item.model_names === 'object') ? item.model_names : {};
         const modelNameMap = {};
         [...item.image_models, ...item.chat_models, ...item.video_models].forEach(model => {
@@ -3779,6 +3827,7 @@ async function saveProviders(){
                 base_url:item.base_url,
                 protocol:(item.id === 'modelscope') ? 'openai' : item.id === 'runninghub' ? 'runninghub' : item.id === 'volcengine' ? 'volcengine' : (item.protocol || 'openai'),
                 image_request_mode:item.image_request_mode || 'openai',
+                image_size_policy:item.image_size_policy || 'auto',
                 image_edit_route:item.image_edit_route || 'general',
                 image_generation_endpoint:item.image_generation_endpoint || '',
                 image_edit_endpoint:item.image_edit_endpoint || '',
@@ -3881,6 +3930,10 @@ window.onload = () => {
             return;
         }
         item.image_request_mode = normalizeImageRequestMode(imageRequestModeInput.value);
+    });
+    if(imageSizePolicyInput) imageSizePolicyInput.addEventListener('change', () => {
+        const item = provider();
+        if(item) item.image_size_policy = normalizeImageSizePolicy(imageSizePolicyInput.value);
     });
     if(imageEditRouteInput) imageEditRouteInput.addEventListener('change', () => {
         const item = provider();

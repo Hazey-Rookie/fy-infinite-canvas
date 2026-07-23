@@ -7,6 +7,7 @@ function trf(key, values={}){
 function langIsEn(){ return window.StudioI18n?.lang?.() === 'en'; }
 const CANVAS_UPLOAD_MAX = 20;
 const CANVAS_REFERENCE_IMAGE_MAX = 20;
+const IMAGE_GENERATION_MAX = 3;
 function actionFailed(labelKey, detail=''){
     const label = tr(labelKey);
     return langIsEn() ? `${label} failed${detail ? `: ${detail}` : ''}` : `${label}失败${detail ? `：${detail}` : ''}`;
@@ -203,22 +204,52 @@ function applyLanguage(lang){
     renderCanvasList();
     render();
 }
+const CANVAS_API_CONFIG_EVENT_TYPES = new Set(['providers-changed','workflows-changed','comfy-instances-changed']);
+const canvasApiConfigEventsSeen = new Map();
+let canvasConfigRefreshTimer = 0;
+let canvasConfigRefreshPromise = null;
+function shouldHandleCanvasApiConfigEvent(data){
+    if(!CANVAS_API_CONFIG_EVENT_TYPES.has(data?.type)) return false;
+    const key = [data.type, data.updated_at || '', data.source || ''].join('|');
+    const now = Date.now();
+    const last = canvasApiConfigEventsSeen.get(key) || 0;
+    if(last && now - last < 1200) return false;
+    canvasApiConfigEventsSeen.set(key, now);
+    if(canvasApiConfigEventsSeen.size > 40) {
+        Array.from(canvasApiConfigEventsSeen.entries()).forEach(([eventKey, at]) => {
+            if(now - at > 2500) canvasApiConfigEventsSeen.delete(eventKey);
+        });
+    }
+    return true;
+}
+function scheduleCanvasConfigRefreshFromEvent(data, delay=520){
+    if(!shouldHandleCanvasApiConfigEvent(data)) return;
+    if(canvasConfigRefreshTimer) clearTimeout(canvasConfigRefreshTimer);
+    canvasConfigRefreshTimer = setTimeout(() => {
+        canvasConfigRefreshTimer = 0;
+        refreshCanvasConfigFromSettings();
+    }, Math.max(0, Number(delay) || 0));
+}
 async function refreshCanvasConfigFromSettings(){
-    await loadConfig();
-    pruneMissingComfyWorkflows();
-    (nodes || []).forEach(node => {
-        sanitizeImageNodeProviderModel(node);
-        sanitizeVideoNodeProviderModel(node);
+    if(canvasConfigRefreshPromise) return canvasConfigRefreshPromise;
+    canvasConfigRefreshPromise = (async () => {
+        await loadConfig();
+        pruneMissingComfyWorkflows();
+        (nodes || []).forEach(node => {
+            sanitizeImageNodeProviderModel(node);
+            sanitizeVideoNodeProviderModel(node);
+        });
+        if(typeof render === 'function') render();
+    })().finally(() => {
+        canvasConfigRefreshPromise = null;
     });
-    if(typeof render === 'function') render();
+    return canvasConfigRefreshPromise;
 }
 window.addEventListener('message', event => {
     if(event.origin && event.origin !== location.origin) return;
     if(event.data?.type === 'studio-lang') applyLanguage(event.data.lang);
     if(event.data?.type === 'canvas_updated') handleCanvasUpdatedMessage(event.data);
-    if(event.data?.type === 'providers-changed' || event.data?.type === 'workflows-changed' || event.data?.type === 'comfy-instances-changed'){
-        refreshCanvasConfigFromSettings();
-    }
+    scheduleCanvasConfigRefreshFromEvent(event.data);
     if(event.data?.type === 'canvas-focus'){
         // 从其他标签页切换回画布时，重新拉取工作流列表并刷新节点
         refreshCanvasConfigFromSettings();
@@ -497,8 +528,8 @@ const SIZE_MAP = {
     ultrawide: { '1k':'1280x544', '2k':'2048x880', '4k':'3840x1648' },
     ultratall: { '1k':'544x1280', '2k':'880x2048', '4k':'1648x3840' }
 };
-const RES_LONG_SIDE = { '1k':1536, '2k':2048, '4k':3840 };
-const RES_PIXEL_LIMIT = { '1k':1572864, '2k':4194304, '4k':8294400 };
+const RES_LONG_SIDE = { '1k':1536, '2k':2048, '4k':4096 };
+const RES_PIXEL_LIMIT = { '1k':1572864, '2k':4194304, '4k':16777216 };
 const CUSTOM_IMAGE_MODELS_KEY = 'canvas_custom_image_models';
 const MANAGED_IMAGE_MODELS_KEY = 'canvas_image_models_ordered';
 const MANAGED_CHAT_MODELS_KEY = 'canvas_chat_models_ordered';
@@ -528,6 +559,7 @@ const DEFAULT_VIDEO_MODELS = [
     // Agnes
     'agnes-video-v2.0'
 ];
+const JIMENG_SEEDANCE_VIDEO_MODELS = ['seedance2.0_vip', 'seedance2.0fast_vip', 'seedance2.0', 'seedance2.0fast', 'seedance2.0mini'];
 
 function uid(prefix='n'){ return `${prefix}_${Math.random().toString(16).slice(2)}_${Date.now()}`; }
 function loadLocalViewportMap(){
@@ -695,7 +727,12 @@ function videoProviderOptions(selectedId){
 function providerVideoModels(providerId){
     // 不走 providerById（会 fallback 到第一个 provider，造成串台），直接查精确匹配
     const provider = apiProviders.find(p => p.id === providerId);
-    return uniqueModels(provider?.video_models || []);
+    const isJimeng = String(providerId || '').trim().toLowerCase() === 'jimeng'
+        || String(provider?.protocol || '').trim().toLowerCase() === 'jimeng';
+    const models = isJimeng
+        ? [...(provider?.video_models || []), ...JIMENG_SEEDANCE_VIDEO_MODELS]
+        : (provider?.video_models || []);
+    return uniqueModels(models);
 }
 function sanitizeVideoNodeProviderModel(node){
     if(!node || node.type !== 'video') return;
@@ -949,8 +986,12 @@ function apiImageSize(ratioValue, resolutionValue, customRatioValue = '', custom
         const longSide = RES_LONG_SIDE[resolutionKey] || 1024;
         if(parsed){
             const pixelLimit = RES_PIXEL_LIMIT[resolutionKey] || (longSide * longSide);
-            const rawWidth = parsed >= 1 ? longSide : Math.min(longSide * parsed, Math.sqrt(pixelLimit * parsed));
-            const rawHeight = parsed >= 1 ? Math.min(longSide / parsed, Math.sqrt(pixelLimit / parsed)) : longSide;
+            const rawWidth = parsed >= 1
+                ? Math.min(longSide, Math.sqrt(pixelLimit * parsed))
+                : Math.min(longSide * parsed, Math.sqrt(pixelLimit * parsed));
+            const rawHeight = parsed >= 1
+                ? rawWidth / parsed
+                : Math.min(longSide, Math.sqrt(pixelLimit / parsed));
             const width = Math.floor(rawWidth / 16) * 16;
             const height = Math.floor(rawHeight / 16) * 16;
             return `${Math.max(64, width)}x${Math.max(64, height)}`;
@@ -1498,11 +1539,7 @@ async function loadConfig(){
 // 监听 API 设置页面的变更广播，实时刷新画布的模型/平台下拉
 try {
     const apiChannel = new BroadcastChannel('studio-api');
-    apiChannel.onmessage = async (e) => {
-        if(e.data?.type === 'providers-changed' || e.data?.type === 'workflows-changed' || e.data?.type === 'comfy-instances-changed'){
-            await refreshCanvasConfigFromSettings();
-        }
-    };
+    apiChannel.onmessage = e => scheduleCanvasConfigRefreshFromEvent(e.data);
 } catch(e) { /* 不支持 BroadcastChannel 的旧浏览器忽略 */ }
 function msChatModelOptions(selected){
     // 单一数据源：从 API 设置里 modelscope 平台的 chat_models 取
@@ -2673,7 +2710,7 @@ function renderMsGenBody(node){
     const selectedMsLora = msLoras.find(lora => String(lora.id || '').trim() === String(node.msLoraId || '').trim()) || msLoras[0];
     const loraEnabled = Boolean(node.msLoraEnabled);
     const loraStrength = node.msLoraStrength ?? Number(selectedMsLora?.strength ?? 0.8);
-    const msCount = Math.max(1, Math.min(8, Number(node.count || 1)));
+    const msCount = Math.max(1, Math.min(IMAGE_GENERATION_MAX, Number(node.count || 1)));
     wrap.innerHTML = `
         <div class="ms-model-tabs">
             ${Object.entries(MS_GEN_MODELS).map(([k,m]) =>
@@ -2923,14 +2960,14 @@ function renderMsGenBody(node){
         msCountInput.onmousedown = e => e.stopPropagation();
         msCountInput.onclick = e => e.stopPropagation();
         msCountInput.oninput = e => {
-            node.count = Math.max(1, Math.min(8, Number(e.target.value) || 1));
+            node.count = Math.max(1, Math.min(IMAGE_GENERATION_MAX, Number(e.target.value) || 1));
             scheduleSave();
         };
-        msCountInput.onblur = e => { e.target.value = String(Math.max(1, Math.min(8, Number(node.count || 1)))); };
+        msCountInput.onblur = e => { e.target.value = String(Math.max(1, Math.min(IMAGE_GENERATION_MAX, Number(node.count || 1)))); };
         wrap.querySelectorAll('[data-ms-step]').forEach(btn => {
             btn.onclick = e => {
                 e.stopPropagation();
-                const next = Math.max(1, Math.min(8, Number(node.count || 1) + Number(btn.dataset.msStep || 0)));
+                const next = Math.max(1, Math.min(IMAGE_GENERATION_MAX, Number(node.count || 1) + Number(btn.dataset.msStep || 0)));
                 node.count = next;
                 msCountInput.value = String(next);
                 scheduleSave();
@@ -3007,7 +3044,7 @@ async function runMsGenNode(nodeId, opts={}){
     const msLoras = modelscopeLorasForModel(msModelId);
     if(!prompt){ alert(tr('canvas.needPrompt')); return; }
     if(msModel.supportsImage && !refs.length){ alert(tr('canvas.needImage')); return; }
-    const count = Math.max(1, Math.min(8, Number(node.count || 1)));
+    const count = Math.max(1, Math.min(IMAGE_GENERATION_MAX, Number(node.count || 1)));
     // 链路中间节点默认不创建 Output；链尾、手动开启或已有 Output 连接时才输出。
     let out = outputForNode(node, 460);
     const pendingIds = Array.from({length:count}, () => uid('p'));
@@ -8237,7 +8274,7 @@ function renderGeneratorBody(node){
                 <div class="gen-count-row">
                     <div class="gen-stepper">
                         <button class="gen-step-btn" data-step="-1" type="button" title="${tr('canvas.decrease')}" aria-label="${tr('canvas.decreaseCount')}"><i data-lucide="chevron-left" class="w-3.5 h-3.5"></i></button>
-                        <input class="gen-count-input" type="text" inputmode="numeric" pattern="[0-9]*" value="${Math.max(1, Math.min(8, Number(node.count || 1)))}">
+                        <input class="gen-count-input" type="text" inputmode="numeric" pattern="[0-9]*" value="${Math.max(1, Math.min(IMAGE_GENERATION_MAX, Number(node.count || 1)))}">
                         <button class="gen-step-btn" data-step="1" type="button" title="${tr('canvas.increase')}" aria-label="${tr('canvas.increaseCount')}"><i data-lucide="chevron-right" class="w-3.5 h-3.5"></i></button>
                     </div>
                 </div>
@@ -8483,15 +8520,15 @@ function renderGeneratorBody(node){
     countInput.onmousedown = e => e.stopPropagation();
     countInput.onclick = e => e.stopPropagation();
     countInput.oninput = e => {
-        const value = Math.max(1, Math.min(8, Number(e.target.value) || 1));
+        const value = Math.max(1, Math.min(IMAGE_GENERATION_MAX, Number(e.target.value) || 1));
         node.count = value;
         scheduleSave();
     };
-    countInput.onblur = e => { e.target.value = String(Math.max(1, Math.min(8, Number(node.count || 1)))); };
+    countInput.onblur = e => { e.target.value = String(Math.max(1, Math.min(IMAGE_GENERATION_MAX, Number(node.count || 1)))); };
     wrap.querySelectorAll('[data-step]').forEach(btn => {
         btn.onclick = e => {
             e.stopPropagation();
-            const next = Math.max(1, Math.min(8, Number(node.count || 1) + Number(btn.dataset.step || 0)));
+            const next = Math.max(1, Math.min(IMAGE_GENERATION_MAX, Number(node.count || 1) + Number(btn.dataset.step || 0)));
             node.count = next;
             countInput.value = String(next);
             scheduleSave();
@@ -9103,7 +9140,7 @@ function applyRhEntrySelection(node, ref){
         node.resolution = node.resolution || defaultApiImageResolution(ref.id);
         node.ratio = node.ratio || 'square';
         node.quality = node.quality || 'auto';
-        node.count = Math.max(1, Math.min(8, Number(node.count || 1)));
+        node.count = Math.max(1, Math.min(IMAGE_GENERATION_MAX, Number(node.count || 1)));
     }
 }
 function currentRunningHubAppConfig(node){
@@ -9432,7 +9469,7 @@ function renderRhBody(node){
     return wrap;
 }
 function rhModelSettingsHtml(node){
-    const count = Math.max(1, Math.min(8, Number(node.count || 1)));
+    const count = Math.max(1, Math.min(IMAGE_GENERATION_MAX, Number(node.count || 1)));
     return `
         <div class="gen-settings rh-model-settings">
             <div class="gen-settings-row api-size-row">
@@ -9462,7 +9499,7 @@ function rhModelSettingsHtml(node){
                     <option value="medium">Q med</option>
                     <option value="high">Q high</option>
                 </select>
-                <input class="setting-input rh-model-count-input" data-rh-model-field="count" type="number" min="1" max="8" step="1" value="${count}" style="width:64px">
+                <input class="setting-input rh-model-count-input" data-rh-model-field="count" type="number" min="1" max="${IMAGE_GENERATION_MAX}" step="1" value="${count}" style="width:64px">
             </div>
             <div class="gen-settings-row custom-ratio-row" style="display:none">
                 <label class="field"><div class="setting-title">${tr('canvas.ratioWidth')}</div><input class="setting-input custom-ratio-w-input" data-rh-model-field="customRatioWidth" type="number" min="1" step="1" value="${escapeHtml(node.customRatioWidth || '')}" placeholder="4"></label>
@@ -9507,7 +9544,7 @@ function bindRhModelControls(wrap, node, media){
         if(resolutionSelect) resolutionSelect.value = node.resolution || defaultApiImageResolution(node.model);
         if(ratioSelect) ratioSelect.value = node.ratio || 'square';
         if(qualitySelect) qualitySelect.value = node.quality || 'auto';
-        if(countInput) countInput.value = Math.max(1, Math.min(8, Number(node.count || 1)));
+        if(countInput) countInput.value = Math.max(1, Math.min(IMAGE_GENERATION_MAX, Number(node.count || 1)));
         if(customRatioRow) customRatioRow.style.display = node.ratio === 'custom' ? '' : 'none';
         if(customSizeRow) customSizeRow.style.display = node.resolution === 'custom' ? '' : 'none';
         if(customRatioWInput) customRatioWInput.value = node.customRatioWidth || '';
@@ -9528,7 +9565,7 @@ function bindRhModelControls(wrap, node, media){
             } else if(field === 'quality'){
                 node.quality = e.target.value || 'auto';
             } else if(field === 'count'){
-                node.count = Math.max(1, Math.min(8, Number(e.target.value || 1)));
+                node.count = Math.max(1, Math.min(IMAGE_GENERATION_MAX, Number(e.target.value || 1)));
             } else if(field === 'customRatioWidth' || field === 'customRatioHeight'){
                 node[field] = e.target.value;
                 node.customRatio = node.customRatioWidth && node.customRatioHeight ? `${node.customRatioWidth}:${node.customRatioHeight}` : '';
@@ -9910,7 +9947,7 @@ async function runRhModelNode(node, opts={}){
     const prompt = media.prompt || '';
     const refs = imageRefsOnly(media.refs || []);
     if(!prompt && !refs.length){ alert(tr('canvas.needPromptOrImage')); return; }
-    const count = Math.max(1, Math.min(8, Number(node.count || 1)));
+    const count = Math.max(1, Math.min(IMAGE_GENERATION_MAX, Number(node.count || 1)));
     let out = outputForNode(node, 500);
     const run = runSnapshot(node, prompt || 'Edit the reference images.', refs);
     run.taskLabel = 'RunningHub';
@@ -10421,7 +10458,7 @@ async function runGenerator(genId, opts={}){
     const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
     const refs = imageRefsOnly(sources.flatMap(s => s.refs || []));
     if(!prompt && !refs.length){ alert(tr('canvas.needPromptOrImage')); return; }
-    const count = Math.max(1, Math.min(8, Number(gen.count || 1)));
+    const count = Math.max(1, Math.min(IMAGE_GENERATION_MAX, Number(gen.count || 1)));
     let out = outputForNode(gen, 460);
     const run = runSnapshot(gen, prompt || 'Edit the reference images.', refs);
     const payload = {
@@ -10429,6 +10466,8 @@ async function runGenerator(genId, opts={}){
         provider_id:resolveImageProviderId(gen.apiProvider || 'comfly'),
         model:resolveImageModel(gen.model),
         size:await generatorSizeForRun(gen, refs),
+        aspect_ratio:gen.ratio === 'custom' ? (gen.customRatio || '') : (gen.ratio || ''),
+        resolution:gen.resolution || '',
         reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
     };
     const quality = normalizedImageQuality(gen.quality);
@@ -10507,7 +10546,7 @@ async function runGeneratorLegacy(genId, opts={}){
     const prompt = sources.map(s => s.prompt).filter(Boolean).join('\n\n');
     const refs = imageRefsOnly(sources.flatMap(s => s.refs || []));
     if(!prompt && !refs.length){ alert(tr('canvas.needPromptOrImage')); return; }
-    const count = Math.max(1, Math.min(8, Number(gen.count || 1)));
+    const count = Math.max(1, Math.min(IMAGE_GENERATION_MAX, Number(gen.count || 1)));
     let out = outputForNode(gen, 460);
     const pendingIds = Array.from({length:count}, () => uid('p'));
     const run = runSnapshot(gen, prompt || 'Edit the reference images.', refs);
@@ -12078,6 +12117,48 @@ function logTaskLabel(log){
     }
     return log?.model || '-';
 }
+async function deleteCanvasLogEntry(logId, deleteMedia=false){
+    if(!canvas || !logId) return;
+    const confirmText = deleteMedia ? tr('canvas.deleteLogMediaConfirm') : tr('canvas.deleteLogConfirm');
+    if(!confirm(confirmText)) return;
+    try {
+        if(localCanvasDirty || saveTimer){
+            clearTimeout(saveTimer);
+            saveTimer = null;
+            await saveCanvas();
+        }
+        const res = await fetch(`/api/canvases/${encodeURIComponent(canvas.id)}/logs/delete`, {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({
+                log_id:logId,
+                delete_unreferenced_media:deleteMedia,
+                reset_referencing_nodes:deleteMedia,
+                base_updated_at:Number(canvas.updated_at || lastCanvasUpdatedAt || 0)
+            })
+        });
+        const data = await res.json().catch(() => ({}));
+        if(!res.ok) throw new Error(data.detail || tr('canvas.logDeleteFailed'));
+        canvas.logs = data.canvas?.logs || (canvas.logs || []).filter(item => item.id !== logId);
+        if(data.canvas?.nodes){
+            canvas.nodes = data.canvas.nodes;
+            canvas.connections = data.canvas.connections || [];
+            nodes = canvas.nodes;
+            connections = canvas.connections;
+            render();
+        }
+        canvas.updated_at = Number(data.canvas?.updated_at || canvas.updated_at || Date.now());
+        lastCanvasUpdatedAt = canvas.updated_at;
+        renderCanvasLog();
+        const notes = [tr('canvas.logDeleted')];
+        if(data.removed_files?.length) notes.push(tr('canvas.logMediaRemoved').replace('{n}', data.removed_files.length));
+        if(data.reset_node_ids?.length) notes.push(tr('canvas.logNodesReset').replace('{n}', data.reset_node_ids.length));
+        if(data.skipped_referenced?.length) notes.push(tr('canvas.logMediaReferenced').replace('{n}', data.skipped_referenced.length));
+        setStatus(notes.join(' · '));
+    } catch(err) {
+        setStatus(err?.message || tr('canvas.logDeleteFailed'));
+    }
+}
 function addGenerationLog({run, outputs=[], runMs=0, error=''}) {
     if(!canvas) return;
     canvas.logs = canvas.logs || [];
@@ -12126,7 +12207,7 @@ function renderCanvasLog(){
             idText ? `ID ${idText}` : '',
             backendText,
         ].filter(Boolean);
-        return `<div class="log-item ${log.status === 'failed' ? 'failed' : ''}">
+        return `<div class="log-item ${log.status === 'failed' ? 'failed' : ''}" data-canvas-log-id="${escapeAttr(log.id || '')}">
             <div class="log-main">
                 <div class="log-meta">
                     <span class="log-chip ${log.status === 'failed' ? 'status-failed' : 'status-ok'}">${escapeHtml(log.status === 'failed' ? tr('canvas.failed') : tr('canvas.success'))}</span>
@@ -12137,6 +12218,10 @@ function renderCanvasLog(){
                 <div class="log-subline">${subParts.map(part => `<span title="${escapeAttr(part)}">${escapeHtml(part)}</span>`).join('')}</div>
                 ${log.error ? `<div class="log-error" title="${escapeAttr(log.error)}" data-error="${escapeAttr(log.error)}">${escapeHtml(log.error)}</div>` : ''}
                 <div class="log-prompt" title="${escapeAttr(log.prompt || tr('canvas.noPromptMeta'))}" data-prompt="${escapeAttr(log.prompt || '')}">${escapeHtml(log.prompt || tr('canvas.noPromptMeta'))}</div>
+                <div class="log-actions">
+                    <button type="button" data-log-delete="record"><i data-lucide="list-x"></i><span>${escapeHtml(tr('canvas.deleteLog'))}</span></button>
+                    <button type="button" class="danger" data-log-delete="media"><i data-lucide="trash-2"></i><span>${escapeHtml(tr('canvas.deleteLogAndMedia'))}</span></button>
+                </div>
             </div>
             <div class="log-thumbs">${thumbs}</div>
         </div>`;
@@ -12166,6 +12251,13 @@ function renderCanvasLog(){
     };
     bindCanvasLogCopy('[data-prompt]', 'prompt');
     bindCanvasLogCopy('[data-error]', 'error');
+    list.querySelectorAll('[data-log-delete]').forEach(button => {
+        button.onclick = e => {
+            e.stopPropagation();
+            const logId = button.closest('[data-canvas-log-id]')?.dataset.canvasLogId || '';
+            deleteCanvasLogEntry(logId, button.dataset.logDelete === 'media');
+        };
+    });
     refreshIcons();
 }
 async function importWorkflowAssetUrl(url, name='workflow'){

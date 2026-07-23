@@ -1,4 +1,22 @@
-# Infinite-Canvas
+# fy-infinite-canvas
+
+基于 [hero8152/Infinite-Canvas](https://github.com/hero8152/Infinite-Canvas) 的公开定制版，保留原作者署名与项目许可证。
+
+本分支主要维护 Docker/自托管部署、前端生产构建、静态资源压缩与缓存，以及图片尺寸兼容性修复。官方更新通过 `upstream` 远程仓库同步，再合并到本项目的维护分支，避免覆盖本地定制。
+
+> 本项目不得用于未经授权的商业封装；二次开发须保持开源并注明原作者。完整条款请见 [LICENSE](LICENSE)。运行时 API Key、平台配置、画布数据和生成素材不会纳入版本控制。
+
+## 版本
+
+| 类型 | 当前版本 | 用途 |
+| --- | --- | --- |
+| fy 定制版 | `0.1.0` | 通过 `FY_VERSION`、Git 标签和镜像标签追踪 fy 改动 |
+| 官方上游 | `2026.07.17` | 通过 `VERSION` 保持官方更新检测兼容 |
+
+版本记录见 [CHANGELOG.md](CHANGELOG.md)。发布提交使用带说明的 Git 标签，例如 `v0.1.0`；生产镜像使用对应的不可变版本标签。
+
+## 上游项目说明
+
 Supports comfyui/API calls/modelscope calls
 
 配套的chrome采集插件已经上线：https://chromewebstore.google.com/detail/infinite-canvas-%E5%9B%BE%E5%83%8F%E8%A7%86%E9%A2%91%E6%96%87%E5%AD%97%E6%8A%93%E5%8F%96%E5%B7%A5/ajfhnbklbmpfaaookhfakohabnpmlcic?authuser=0&hl=en

@@ -167,6 +167,7 @@
         "api.recommendRunninghubSummary": { zh: "RunningHub 覆盖图像、LLM、视频和工作流能力，适合一套 Key 接入多类型生成任务。", en: "RunningHub covers image, LLM, video, and workflow capabilities for multi-modal generation with one key." },
         "api.recommendFhlSummary": { zh: "稳定便宜接入 codex/Claude/GPT Image 2出图。", en: "Stable and affordable access to codex/Claude/GPT Image 2 image generation." },
         "api.recommendVipGptSummary": { zh: "支持 AI 编程的模型和生图模型，还可以包月使用。", en: "Supports AI coding models and image generation models, with monthly subscription options." },
+        "api.recommendTudouSummary": { zh: "土豆 API 提供 LLM、图像和视频模型接入，OpenAI 兼容配置简单，适合多类型生成任务。", en: "Tudou API provides LLM, image, and video model access with simple OpenAI-compatible setup for multi-modal generation." },
         "api.recommendLingjingSummary": { zh: "灵境 API 提供图像、视频和 LLM 模型接入，使用专属注册链接可享六折优惠，适合低成本接入多模型工作流。", en: "Lingjing API provides image, video, and LLM model access with a dedicated 40% off registration link for lower-cost multi-model workflows." },
         "api.recommendLingjingCheckin": { zh: "签到送积分", en: "Check-in credits" },
         "api.recommendLingjingDiscount": { zh: "六折", en: "40% off" },

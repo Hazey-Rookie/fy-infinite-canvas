@@ -1,14 +1,14 @@
 {
-  "version": "2026.07.17",
-  "updated_at": "2026-07-17T21:50:36+08:00",
+  "version": "2026.07.23",
+  "updated_at": "2026-07-23T21:50:36+08:00",
   "items": [
     {
       "type": "feature",
-      "text": "修复exellome和FHL的编辑功能报错bug"
+      "text": "修复即梦CLI报错，新增5.0pro和SD2.0 mini协议，新增图片2k/4k/8k放大选项"
     },
     {
       "type": "feature",
-      "text": "修复mac系统缩放bug"
+      "text": "新增土豆API协议"
     }
   ]
 }

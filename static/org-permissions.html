@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>组织与权限</title>
+    <link rel="stylesheet" href="/static/vendor/css/fonts.css?v=2026.07.23.1784827838">
+    <link rel="stylesheet" href="/static/css/org-permissions.css?v=2026.07.23.1784828112">
+</head>
+<body>
+    <div class="page-shell">
+        <header class="page-header">
+            <div>
+                <h1>组织与权限</h1>
+                <div class="header-meta"><span id="sourceBadge" class="status-badge">正在连接</span><span id="identityLabel"></span></div>
+            </div>
+            <button id="refreshBtn" class="icon-command" type="button" title="刷新组织架构" aria-label="刷新组织架构">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"></path><path d="M20 4v6h-6"></path></svg>
+            </button>
+        </header>
+        <div id="notice" class="notice" hidden></div>
+        <nav class="tabs" aria-label="权限视图">
+            <button class="tab active" type="button" data-tab="members">成员授权</button>
+            <button class="tab" type="button" data-tab="roles">角色菜单</button>
+        </nav>
+        <main>
+            <section id="membersPanel" class="panel active">
+                <div class="toolbar">
+                    <label class="search-field">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+                        <input id="memberSearch" type="search" placeholder="搜索姓名、邮箱或部门">
+                    </label>
+                    <div id="memberSummary" class="summary"></div>
+                </div>
+                <div class="table-wrap">
+                    <table><thead><tr><th>成员</th><th>部门</th><th>角色</th><th>状态</th><th>操作</th></tr></thead><tbody id="memberRows"></tbody></table>
+                    <div id="memberEmpty" class="empty" hidden>暂无可见成员</div>
+                </div>
+            </section>
+            <section id="rolesPanel" class="panel">
+                <div class="role-layout">
+                    <aside class="role-list-pane">
+                        <div class="pane-heading"><strong>角色</strong><button id="newRoleBtn" class="icon-command small" type="button" title="新增角色" aria-label="新增角色"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg></button></div>
+                        <div id="roleList" class="role-list"></div>
+                    </aside>
+                    <section class="role-editor">
+                        <div class="editor-heading">
+                            <div><input id="roleName" class="role-name-input" type="text" placeholder="role_key" maxlength="40"><input id="roleDisplayName" class="role-display-input" type="text" placeholder="角色名称" maxlength="40"></div>
+                            <button id="saveRoleBtn" class="primary-command" type="button">保存角色</button>
+                        </div>
+                        <div id="permissionGroups" class="permission-groups"></div>
+                    </section>
+                </div>
+            </section>
+        </main>
+    </div>
+    <div id="toast" class="toast" role="status" hidden></div>
+    <script src="/static/js/org-permissions.js?v=2026.07.23.1784828112"></script>
+</body>
+</html>
