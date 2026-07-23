@@ -1,0 +1,10 @@
+{
+  "name": "fy-infinite-canvas-frontend-build",
+  "private": true,
+  "scripts": {
+    "build:css": "tailwindcss -c tailwind.config.cjs -i ./static/css/tailwind.input.css -o ./static/css/tailwind.generated.css --minify"
+  },
+  "devDependencies": {
+    "tailwindcss": "3.4.17"
+  }
+}

@@ -497,8 +497,8 @@ const SIZE_MAP = {
     ultrawide: { '1k':'1280x544', '2k':'2048x880', '4k':'3840x1648' },
     ultratall: { '1k':'544x1280', '2k':'880x2048', '4k':'1648x3840' }
 };
-const RES_LONG_SIDE = { '1k':1536, '2k':2048, '4k':3840 };
-const RES_PIXEL_LIMIT = { '1k':1572864, '2k':4194304, '4k':8294400 };
+const RES_LONG_SIDE = { '1k':1536, '2k':2048, '4k':4096 };
+const RES_PIXEL_LIMIT = { '1k':1572864, '2k':4194304, '4k':16777216 };
 const CUSTOM_IMAGE_MODELS_KEY = 'canvas_custom_image_models';
 const MANAGED_IMAGE_MODELS_KEY = 'canvas_image_models_ordered';
 const MANAGED_CHAT_MODELS_KEY = 'canvas_chat_models_ordered';
@@ -949,8 +949,12 @@ function apiImageSize(ratioValue, resolutionValue, customRatioValue = '', custom
         const longSide = RES_LONG_SIDE[resolutionKey] || 1024;
         if(parsed){
             const pixelLimit = RES_PIXEL_LIMIT[resolutionKey] || (longSide * longSide);
-            const rawWidth = parsed >= 1 ? longSide : Math.min(longSide * parsed, Math.sqrt(pixelLimit * parsed));
-            const rawHeight = parsed >= 1 ? Math.min(longSide / parsed, Math.sqrt(pixelLimit / parsed)) : longSide;
+            const rawWidth = parsed >= 1
+                ? Math.min(longSide, Math.sqrt(pixelLimit * parsed))
+                : Math.min(longSide * parsed, Math.sqrt(pixelLimit * parsed));
+            const rawHeight = parsed >= 1
+                ? rawWidth / parsed
+                : Math.min(longSide, Math.sqrt(pixelLimit / parsed));
             const width = Math.floor(rawWidth / 16) * 16;
             const height = Math.floor(rawHeight / 16) * 16;
             return `${Math.max(64, width)}x${Math.max(64, height)}`;

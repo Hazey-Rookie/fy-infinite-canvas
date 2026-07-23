@@ -1,0 +1,28 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.log
+
+# Front-end build dependencies
+node_modules/
+
+# Local credentials and runtime configuration
+API/.env
+API/*.local
+API/*.secret
+.env
+.env.*
+!.env.example
+
+# Runtime-generated Canvas data
+data/*
+!data/asset_library.json
+assets/
+output/
+
+# Local Codex state and image archives
+.codex/
+codex-home/
+*.tar
+*.tar.gz
+

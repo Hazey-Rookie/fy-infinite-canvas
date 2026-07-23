@@ -8,6 +8,7 @@ const idInput = document.getElementById('idInput');
 const baseInput = document.getElementById('baseInput');
 const protocolInput = document.getElementById('protocolInput');
 const imageRequestModeInput = document.getElementById('imageRequestModeInput');
+const imageSizePolicyInput = document.getElementById('imageSizePolicyInput');
 const imageEditRouteInput = document.getElementById('imageEditRouteInput');
 const keyInput = document.getElementById('keyInput');
 const keyHint = document.getElementById('keyHint');
@@ -800,6 +801,7 @@ function syncEditor(){
             ? lockedApi.image_request_mode
             : (imageRequestModeInput?.value || item.image_request_mode)
     );
+    item.image_size_policy = normalizeImageSizePolicy(imageSizePolicyInput?.value || item.image_size_policy);
     item.image_edit_route = normalizeImageEditRoute(
         item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || CLI_PROTOCOLS.has(selectedProtocol)
             ? 'general'
@@ -2495,6 +2497,10 @@ function renderEditor(){
         imageRequestModeInput.disabled = Boolean(lockedApi) || item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || CLI_PROTOCOLS.has(String(protocolInput?.value || item.protocol || '').toLowerCase());
         imageRequestModeInput.title = lockedApi ? '推荐平台使用固定图片协议' : '';
     }
+    if(imageSizePolicyInput){
+        imageSizePolicyInput.value = normalizeImageSizePolicy(item.image_size_policy);
+        imageSizePolicyInput.disabled = item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || ['jimeng', 'gemini-cli'].includes(String(protocolInput?.value || item.protocol || '').toLowerCase());
+    }
     if(imageEditRouteInput){
         imageEditRouteInput.value = normalizeImageEditRoute(item.image_edit_route);
         imageEditRouteInput.disabled = item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || CLI_PROTOCOLS.has(String(protocolInput?.value || item.protocol || '').toLowerCase());
@@ -2871,6 +2877,10 @@ function currentProviderApiKey(item){
 function normalizeImageRequestMode(value){
     const mode = String(value || '').trim().toLowerCase();
     return ['openai', 'openai-json', 'openai-video-proxy', 'openai-responses'].includes(mode) ? mode : 'openai';
+}
+function normalizeImageSizePolicy(value){
+    const policy = String(value || '').trim().toLowerCase();
+    return ['auto', 'openai', 'passthrough'].includes(policy) ? policy : 'auto';
 }
 function normalizeImageEditRoute(value){
     const route = String(value || '').trim().toLowerCase();
@@ -3517,7 +3527,7 @@ function addProvider(){
     let id = 'custom-api';
     let index = 2;
     while(providers.some(item => item.id === id)) id = `custom-api-${index++}`;
-    providers.push({id, name:'API', base_url:'', protocol:'openai', image_request_mode:'openai', image_edit_route:'general', image_generation_endpoint:'', image_edit_endpoint:'', enabled:true, primary:false, image_models:[], chat_models:[], video_models:[], has_key:false, key_preview:''});
+    providers.push({id, name:'API', base_url:'', protocol:'openai', image_request_mode:'openai', image_size_policy:'auto', image_edit_route:'general', image_generation_endpoint:'', image_edit_endpoint:'', enabled:true, primary:false, image_models:[], chat_models:[], video_models:[], has_key:false, key_preview:''});
     selectedId = id;
     renderEditor();
 }
@@ -3537,6 +3547,7 @@ async function addCliProvider(kind){
             base_url:'',
             protocol:preset.protocol,
             image_request_mode:'openai',
+            image_size_policy:'auto',
             image_edit_route:'general',
             image_generation_endpoint:'',
             image_edit_endpoint:'',
@@ -3728,6 +3739,7 @@ async function saveProviders(){
                 ? 'openai'
                 : item.image_request_mode
         );
+        item.image_size_policy = normalizeImageSizePolicy(item.image_size_policy);
         item.image_edit_route = normalizeImageEditRoute(
             item.id === 'modelscope' || item.id === 'runninghub' || item.id === 'volcengine' || isCliProtocol
                 ? 'general'
@@ -3779,6 +3791,7 @@ async function saveProviders(){
                 base_url:item.base_url,
                 protocol:(item.id === 'modelscope') ? 'openai' : item.id === 'runninghub' ? 'runninghub' : item.id === 'volcengine' ? 'volcengine' : (item.protocol || 'openai'),
                 image_request_mode:item.image_request_mode || 'openai',
+                image_size_policy:item.image_size_policy || 'auto',
                 image_edit_route:item.image_edit_route || 'general',
                 image_generation_endpoint:item.image_generation_endpoint || '',
                 image_edit_endpoint:item.image_edit_endpoint || '',
@@ -3881,6 +3894,10 @@ window.onload = () => {
             return;
         }
         item.image_request_mode = normalizeImageRequestMode(imageRequestModeInput.value);
+    });
+    if(imageSizePolicyInput) imageSizePolicyInput.addEventListener('change', () => {
+        const item = provider();
+        if(item) item.image_size_policy = normalizeImageSizePolicy(imageSizePolicyInput.value);
     });
     if(imageEditRouteInput) imageEditRouteInput.addEventListener('change', () => {
         const item = provider();

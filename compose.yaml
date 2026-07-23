@@ -1,0 +1,26 @@
+services:
+  infinite-canvas:
+    build:
+      context: .
+    container_name: infinite-canvas
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      TZ: Asia/Shanghai
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - api-config:/app/API
+      - canvas-data:/app/data
+      - assets:/app/assets
+      - output:/app/output
+      - workflows:/app/workflows
+      - codex-home:/home/app/.codex
+
+volumes:
+  api-config:
+  canvas-data:
+  assets:
+  output:
+  workflows:
+  codex-home:

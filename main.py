@@ -38,6 +38,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 
 QUIET_ACCESS_PATHS = {
     "/api/queue_status",
@@ -74,6 +75,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
+
+@app.middleware("http")
+async def add_static_cache_headers(request: Request, call_next):
+    response = await call_next(request)
+    if response.status_code == 200 and request.url.path.startswith("/static/"):
+        if request.query_params.get("v"):
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        elif "cache-control" not in response.headers:
+            response.headers["Cache-Control"] = "public, max-age=3600"
+    return response
 
 # --- WebSocket 状态管理器 ---
 class ConnectionManager:
@@ -163,6 +175,7 @@ class ConnectionManager:
 manager = ConnectionManager()
 GLOBAL_LOOP = None
 APP_VERSION = "2026.06.03"
+FY_REPO_URL = "https://github.com/chuanLL/fy-infinite-canvas"
 GITHUB_REPO_URL = "https://github.com/hero8152/Infinite-Canvas"
 GITHUB_VERSION_URL = "https://raw.githubusercontent.com/hero8152/Infinite-Canvas/main/VERSION"
 GITHUB_TREE_URL = "https://api.github.com/repos/hero8152/Infinite-Canvas/git/trees/main?recursive=1"
@@ -395,6 +408,10 @@ RUNNINGHUB_DEFAULT_VIDEO_MODELS = [
     "seedance-2.0-global/text-to-video",
     "seedance-2.0-global/image-to-video",
 ]
+RUNNINGHUB_IMAGE_ASPECT_RATIOS = (
+    "1:1", "1:2", "2:1", "1:3", "3:1", "2:3", "3:2", "3:4",
+    "4:3", "4:5", "5:4", "9:16", "16:9", "9:21", "21:9",
+)
 RUNNINGHUB_MODEL_ENDPOINT_ALIASES = {
     "Seedance2.0 Image to Video": "bytedance/seedance-2.0-global/image-to-video",
     "Seedance2.0 Text to Video": "bytedance/seedance-2.0-global/text-to-video",
@@ -1177,6 +1194,10 @@ def normalize_image_request_mode(value):
     mode = str(value or "").strip().lower()
     return mode if mode in SUPPORTED_IMAGE_REQUEST_MODES else "openai"
 
+def normalize_image_size_policy(value):
+    policy = str(value or "").strip().lower()
+    return policy if policy in {"auto", "openai", "passthrough"} else "auto"
+
 LOCKED_RECOMMENDED_PROVIDER_RULES = {
     "exellome": {
         "names": {"exellome"},
@@ -1263,6 +1284,7 @@ def normalize_provider(item):
     if protocol not in SUPPORTED_PROVIDER_PROTOCOLS:
         protocol = "openai"
     image_request_mode = detect_image_request_mode(base_url, item.get("image_models") or []) or normalize_image_request_mode(item.get("image_request_mode"))
+    image_size_policy = normalize_image_size_policy(item.get("image_size_policy"))
     image_generation_endpoint = normalize_endpoint_override(item.get("image_generation_endpoint"), "文生图端口")
     image_edit_endpoint = normalize_endpoint_override(item.get("image_edit_endpoint"), "图生图/编辑端口")
     volc_project = re.sub(r"\s+", " ", str(item.get("volcengine_project_name") or "").strip())[:80]
@@ -1293,6 +1315,7 @@ def normalize_provider(item):
         "base_url": base_url,
         "protocol": protocol,
         "image_request_mode": image_request_mode,
+        "image_size_policy": image_size_policy,
         "image_generation_endpoint": image_generation_endpoint,
         "image_edit_endpoint": image_edit_endpoint,
         "enabled": bool(item.get("enabled", True)),
@@ -1487,6 +1510,16 @@ def current_app_version():
         return time.strftime("%Y.%m.%d", time.localtime())
     except Exception:
         return ""
+
+def current_fy_version():
+    version_file = os.path.join(BASE_DIR, "FY_VERSION")
+    try:
+        if os.path.exists(version_file):
+            with open(version_file, "r", encoding="utf-8") as f:
+                return (f.read().strip().splitlines() or [""])[0].strip()
+    except Exception:
+        pass
+    return ""
 
 def update_notes_path() -> str:
     return os.path.join(STATIC_DIR, "update-notes.json")
@@ -1759,6 +1792,9 @@ def app_info():
     version = current_app_version()
     return {
         "version": version,
+        "upstream_version": version,
+        "fy_version": current_fy_version(),
+        "fy_repo_url": FY_REPO_URL,
         "repo_url": GITHUB_REPO_URL,
         "version_url": GITHUB_VERSION_URL,
         "tree_url": GITHUB_TREE_URL,
@@ -2598,6 +2634,7 @@ class ApiProviderPayload(BaseModel):
     base_url: str = ""
     protocol: str = "openai"
     image_request_mode: str = "openai"
+    image_size_policy: str = "auto"
     image_generation_endpoint: str = ""
     image_edit_endpoint: str = ""
     enabled: bool = True
@@ -8949,11 +8986,13 @@ def chat_prompt_size_override(message, current_size=""):
         return options[1] if len(options) > 1 else options[0]
     return options[0]
 
-# GPT-Image-2 限制：长边最大 3840，主要受最大像素限制（约 829 万 = 3840x2160）。
-# 这里只用于上游报错后给出友好的像素上限提示；不对尺寸做任何缩小（用户选什么就原样发送）。
+# OpenAI GPT-Image-2 的自定义尺寸限制：长边最大 3840、总像素最大约 829 万
+#（3840x2160）。第三方平台可能提供额外的 4K 放大能力，因此允许按平台覆盖。
 GPT_IMAGE2_MAX_EDGE = 3840
 GPT_IMAGE2_MAX_PIXELS = 8_294_400
 GPT_IMAGE2_MIN_PIXELS = 655_360
+GPT_IMAGE2_UHD_LIMIT_HOSTS = {"api.openai.com", "api2.jojocode.com"}
+GPT_IMAGE2_NATIVE_4K_HOSTS = {"codeok.cc"}
 
 def is_gpt_image_2_model(model):
     raw = str(model or "").strip().lower()
@@ -8969,14 +9008,40 @@ def is_gpt_image_2_model(model):
         or compact.endswith("gptimage2")
     )
 
+def provider_host(provider):
+    base_url = str((provider or {}).get("base_url") or "").strip()
+    try:
+        host = urllib.parse.urlsplit(base_url).hostname or ""
+    except Exception:
+        host = ""
+    return host.lower()
+
+def host_matches(host, candidates):
+    return any(host == candidate or host.endswith(f".{candidate}") for candidate in candidates)
+
+def gpt_image_2_size_policy(provider, model):
+    """Resolve GPT Image sizing without assuming every compatible proxy has identical limits."""
+    configured = normalize_image_size_policy((provider or {}).get("image_size_policy"))
+    if configured != "auto":
+        return configured
+
+    host = provider_host(provider)
+    model_name = str(model or "").strip().lower()
+    if host_matches(host, GPT_IMAGE2_NATIVE_4K_HOSTS):
+        return "passthrough"
+    if host_matches(host, GPT_IMAGE2_UHD_LIMIT_HOSTS):
+        return "openai"
+    if re.search(r"(?:^|[-_/])4k(?:$|[-_/])", model_name):
+        return "passthrough"
+
+    protocol = str((provider or {}).get("protocol") or "openai").strip().lower()
+    return "openai" if protocol in {"openai", "codex"} else "passthrough"
+
 def normalize_gpt_image_2_size(size):
     width, height = parse_size_pair(size)
     if not width or not height:
         return size or "auto"
-    # 已在 GPT 支持范围内（长边≤3840 且 总像素≤约829万）的尺寸原样返回，不做任何改动。
-    if max(width, height) <= GPT_IMAGE2_MAX_EDGE and width * height <= GPT_IMAGE2_MAX_PIXELS:
-        return f"{width}x{height}"
-    # 超限时按比例等比缩小到 GPT 上限，保持原始宽高比（例如 4096x4096 → ~2864x2864，仍是 1:1）。
+    # 先约束到官方 1:3 至 3:1 的画幅，再按边长和总像素限制等比缩放。
     ratio = width / height
     if ratio > 3:
         width = height * 3
@@ -8993,7 +9058,19 @@ def normalize_gpt_image_2_size(size):
         grow = (GPT_IMAGE2_MIN_PIXELS / max(1, width * height)) ** 0.5
         width = int((width * grow + 15) // 16) * 16
         height = int((height * grow + 15) // 16) * 16
+    # 独立取整可能让边界比例略微越过 3:1，再向内收敛一次。
+    if width > height * 3:
+        width = max(16, int((height * 3) // 16) * 16)
+    elif height > width * 3:
+        height = max(16, int((width * 3) // 16) * 16)
     return f"{width}x{height}"
+
+def adapt_image_request_size(provider, model, size):
+    if not is_gpt_image_2_model(model):
+        return size
+    if gpt_image_2_size_policy(provider, model) != "openai":
+        return size
+    return normalize_gpt_image_2_size(size)
 
 def gpt_image_2_size_error_message(size):
     width, height = parse_size_pair(size)
@@ -9817,6 +9894,32 @@ def runninghub_aspect_from_size(size, fallback="1:1"):
         return raw.replace(" ", "")
     return fallback
 
+def runninghub_supported_aspect_ratio(value, options=None, fallback="1:1"):
+    """Map arbitrary dimensions to the nearest ratio accepted by RunningHub."""
+    raw_value = str(value or "").strip()
+    raw_options = [str(option or "").strip() for option in (options or RUNNINGHUB_IMAGE_ASPECT_RATIOS)]
+    if raw_value == "auto" and "auto" in raw_options:
+        return "auto"
+    candidates = []
+    for raw in raw_options:
+        match = re.fullmatch(r"(\d+)\s*:\s*(\d+)", raw)
+        if not match:
+            continue
+        width, height = int(match.group(1)), int(match.group(2))
+        if width > 0 and height > 0:
+            candidates.append((raw.replace(" ", ""), width / height))
+    if not candidates:
+        return fallback
+
+    exact = next((raw for raw, _ratio in candidates if raw == raw_value), "")
+    if exact:
+        return exact
+    match = re.fullmatch(r"(\d+)\s*:\s*(\d+)", raw_value)
+    if not match or int(match.group(1)) <= 0 or int(match.group(2)) <= 0:
+        return next((raw for raw, _ratio in candidates if raw == fallback), candidates[0][0])
+    target = int(match.group(1)) / int(match.group(2))
+    return min(candidates, key=lambda item: abs(math.log(target / item[1])))[0]
+
 def runninghub_resolution_from_size(size, fallback="2k"):
     width, height = parse_size_pair(size)
     if width and height:
@@ -9843,6 +9946,11 @@ def runninghub_is_image_to_video(value):
     text = str(value or "").strip().lower()
     compact = re.sub(r"[\s_/]+", "-", text)
     return "image-to-video" in compact or "-i2v" in compact or compact.endswith("i2v")
+
+def runninghub_is_image_edit_model(*values):
+    text = " ".join(str(value or "").strip().lower() for value in values)
+    compact = re.sub(r"[\s_]+", "-", text)
+    return "image-to-image" in compact or "/edit" in compact or " edit" in compact
 
 def runninghub_apply_schema_defaults(body, params):
     for field in params or []:
@@ -10338,10 +10446,14 @@ async def generate_runninghub_provider_image(prompt, size, model, reference_imag
     body = {"prompt": prompt}
     if runninghub_schema_field(params, "aspectRatio"):
         field = runninghub_schema_field(params, "aspectRatio")
-        body["aspectRatio"] = runninghub_schema_value(field, aspect)
+        body["aspectRatio"] = runninghub_supported_aspect_ratio(aspect, runninghub_schema_options(field))
     elif runninghub_schema_field(params, "ratio"):
         field = runninghub_schema_field(params, "ratio")
-        body["ratio"] = runninghub_schema_value(field, aspect)
+        body["ratio"] = runninghub_supported_aspect_ratio(aspect, runninghub_schema_options(field))
+    else:
+        # The registry occasionally omits params, while the image endpoint still
+        # requires aspectRatio and rejects its former "empty" sentinel value.
+        body["aspectRatio"] = runninghub_supported_aspect_ratio(aspect)
     if runninghub_schema_field(params, "resolution"):
         field = runninghub_schema_field(params, "resolution")
         body["resolution"] = runninghub_schema_value(field, resolution)
@@ -10360,8 +10472,14 @@ async def generate_runninghub_provider_image(prompt, size, model, reference_imag
             url = await runninghub_upload_reference(client, provider, ref)
             if url:
                 image_urls.append(url)
+        image_field = runninghub_schema_field(params, "imageUrls", "imageUrl", "images", "image")
+        requires_image = bool(image_field and image_field.get("required") is True) or runninghub_is_image_edit_model(
+            model,
+            model_def.get("endpoint"),
+        )
+        if requires_image and not image_urls:
+            raise HTTPException(status_code=400, detail="当前 RunningHub 模型是图生图/图片编辑模型，请先连接至少一张参考图片。若只输入提示词，请改选 text-to-image 文生图模型。")
         if image_urls:
-            image_field = runninghub_schema_field(params, "imageUrls", "imageUrl", "images", "image")
             key = str((image_field or {}).get("fieldKey") or "imageUrls")
             if key.endswith("s") or (image_field or {}).get("multipleInputs") is True:
                 body[key] = image_urls
@@ -10481,6 +10599,7 @@ async def generate_runninghub_video(payload, provider):
 
 async def generate_ai_image(prompt, size, quality, model, reference_images=None, provider_id="comfly"):
     provider = get_api_provider(provider_id)
+    size = adapt_image_request_size(provider, model, size)
     if provider["id"] == "modelscope":
         return await generate_modelscope_provider_image(prompt, size, model, reference_images, provider)
     if is_codex_provider(provider):
@@ -10497,8 +10616,6 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
         return await generate_volcengine_provider_image(prompt, size, model, reference_images, provider)
     is_gpt2 = is_gpt_image_2_model(model)
     is_apimart = is_apimart_provider(provider)
-    # 不对 GPT 尺寸做任何缩小/拦截：用户选什么尺寸就原样发给上游；
-    # 若超过 GPT 的最大像素限制被上游拒绝，再由 friendly_image_error_detail 给出友好的像素上限提示。
     quality = str(quality or "").strip().lower()
     if quality not in {"low", "medium", "high"}:
         quality = ""
