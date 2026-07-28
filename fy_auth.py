@@ -866,6 +866,9 @@ SENSITIVE_STATIC_PERMISSIONS = {
     "/static/comfyui-settings.html": "menu:workflow-settings",
     "/static/org-permissions.html": "menu:organization-permissions",
 }
+DISABLED_LOCAL_STATIC_PATHS = {
+    "/static/zimage.html", "/static/enhance.html", "/static/klein.html", "/static/angle.html",
+}
 
 
 def _management_permission(path: str, method: str) -> str:
@@ -889,6 +892,8 @@ async def auth_middleware(service: AuthService, request: Request, call_next):
     method = request.method.upper()
     if path in PUBLIC_AUTH_PATHS or path == "/static/login.html" or path.startswith("/static/images/") or path.startswith("/static/vendor/"):
         return await call_next(request)
+    if path in DISABLED_LOCAL_STATIC_PATHS:
+        return RedirectResponse("/")
     try:
         user = await service.current_user(request)
     except FeishuAPIError as exc:

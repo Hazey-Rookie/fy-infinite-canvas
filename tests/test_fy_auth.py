@@ -436,6 +436,16 @@ class MiddlewareBoundaryTests(unittest.TestCase):
         self.assertEqual(response.status_code, 302)
         self.assertEqual(response.headers["location"], "/static/login.html")
 
+    def test_disabled_local_page_redirects_to_studio(self):
+        service = AuthService(settings())
+        next_handler = AsyncMock(return_value=JSONResponse({"ok": True}))
+        response = asyncio.run(auth_middleware(
+            service, self.request(method="GET", path="/static/enhance.html"), next_handler,
+        ))
+        self.assertEqual(response.status_code, 307)
+        self.assertEqual(response.headers["location"], "/")
+        next_handler.assert_not_awaited()
+
     def test_non_super_admin_cannot_manage_records(self):
         service = AuthService(settings())
         service.current_user = AsyncMock(return_value={
@@ -476,6 +486,15 @@ class MiddlewareBoundaryTests(unittest.TestCase):
         self.assertEqual(delete_error.exception.status_code, 400)
         service.store.save_member.assert_not_awaited()
         service.store.delete_member.assert_not_awaited()
+
+    def test_logout_deletes_session_cookie(self):
+        service = AuthService(settings())
+        app = FastAPI()
+        register_auth(app, service)
+        logout = endpoint(app, "/api/auth/logout", "POST")
+        response = asyncio.run(logout())
+        self.assertEqual(response.status_code, 302)
+        self.assertIn('fy_session=""', response.headers.get("set-cookie", ""))
 
 
 if __name__ == "__main__":
