@@ -54,7 +54,6 @@ jobs:
           tags: |
             ghcr.io/hazey-rookie/fy-infinite-canvas:sha-${{ github.sha }}
             ghcr.io/hazey-rookie/fy-infinite-canvas:fy-${{ steps.fy-version.outputs.version }}
-            ghcr.io/hazey-rookie/fy-infinite-canvas:branch-${{ github.ref_name }}
           labels: |
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.version=${{ steps.fy-version.outputs.version }}
