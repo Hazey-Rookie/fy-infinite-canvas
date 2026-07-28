@@ -4,8 +4,8 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>组织与权限</title>
-    <link rel="stylesheet" href="/static/vendor/css/fonts.css?v=2026.07.23.1784827838">
-    <link rel="stylesheet" href="/static/css/org-permissions.css?v=2026.07.23.1785230213">
+    <link rel="stylesheet" href="/static/vendor/css/fonts.css?v=2026.07.28.1.1784827838">
+    <link rel="stylesheet" href="/static/css/org-permissions.css?v=2026.07.28.1.1785271369">
 </head>
 <body>
     <div class="page-shell">
@@ -22,6 +22,7 @@
         <nav class="tabs" aria-label="权限视图">
             <button class="tab active" type="button" data-tab="members">成员授权</button>
             <button class="tab" type="button" data-tab="roles">角色菜单</button>
+            <button class="tab" type="button" data-tab="external" id="externalTab" hidden>外部账号</button>
         </nav>
         <main>
             <section id="membersPanel" class="panel active">
@@ -52,9 +53,28 @@
                     </section>
                 </div>
             </section>
+            <section id="externalPanel" class="panel">
+                <div class="toolbar"><strong>外部账号</strong><span id="externalSummary" class="summary"></span></div>
+                <form id="externalAccountForm" class="external-account-form">
+                    <label class="external-field"><span>账号</span><input id="externalUsername" required maxlength="64" autocomplete="off"></label>
+                    <label class="external-field"><span>展示名称</span><input id="externalDisplayName" required maxlength="80"></label>
+                    <label class="external-field"><span>初始密码</span><input id="externalPassword" required minlength="8" type="password" autocomplete="new-password"></label>
+                    <label class="external-field external-role-field"><span>角色</span><select id="externalRole"></select></label>
+                    <div class="external-expiry-field">
+                        <label class="external-field"><span>到期日期</span><input id="externalExpiresAt" required type="date"></label>
+                        <div class="expiry-presets" role="group" aria-label="有效期快捷选择">
+                            <button type="button" data-expiry-days="7">一周</button>
+                            <button type="button" data-expiry-days="30" class="active">一个月</button>
+                            <button type="button" data-expiry-days="90">三个月</button>
+                        </div>
+                    </div>
+                    <button class="primary-command external-create-command" type="submit">创建账号</button>
+                </form>
+                <div class="table-wrap"><table class="external-accounts-table"><thead><tr><th>账号</th><th>角色</th><th>状态</th><th>到期日期</th><th>操作</th></tr></thead><tbody id="externalAccountRows"></tbody></table></div>
+            </section>
         </main>
     </div>
     <div id="toast" class="toast" role="status" hidden></div>
-    <script src="/static/js/org-permissions.js?v=2026.07.23.1785230213"></script>
+    <script src="/static/js/org-permissions.js?v=2026.07.28.1.1785271234"></script>
 </body>
 </html>

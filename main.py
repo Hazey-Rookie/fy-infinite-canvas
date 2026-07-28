@@ -1510,6 +1510,9 @@ def current_fy_version():
 def update_notes_path() -> str:
     return os.path.join(STATIC_DIR, "update-notes.json")
 
+def fy_update_notes_path() -> str:
+    return os.path.join(STATIC_DIR, "fy-update-notes.json")
+
 def safe_update_notes(payload: Any, version: str = "") -> Dict[str, Any]:
     if not isinstance(payload, dict):
         return {}
@@ -1555,6 +1558,20 @@ def read_local_update_notes(version: str = "") -> Dict[str, Any]:
     except Exception:
         pass
     return {"version": version or current_app_version(), "updated_at": "", "items": []}
+
+def read_local_fy_update_notes() -> Dict[str, Any]:
+    version = current_fy_version()
+    try:
+        path = fy_update_notes_path()
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                notes = safe_update_notes(json.load(f), version)
+                if notes:
+                    notes["version"] = version
+                    return notes
+    except Exception:
+        pass
+    return {"version": version, "updated_at": "", "items": []}
 
 def fetch_remote_update_notes(url: str, version: str = "", timeout: float = 5.0) -> Dict[str, Any]:
     info: Dict[str, Any] = {"ok": False, "error": "", "url": url, "version": version, "items": []}
@@ -1801,6 +1818,7 @@ def app_info():
             },
         },
         "update_notes": read_local_update_notes(version),
+        "fy_update_notes": read_local_fy_update_notes(),
     }
 
 def connectivity_probe(name: str, url: str, timeout: float = 5.0) -> Dict[str, Any]:
@@ -3630,7 +3648,9 @@ def api_headers(json_body=True, provider=None, model=""):
         api_key = AI_API_KEY
         if not api_key:
             raise HTTPException(status_code=400, detail="未配置 COMFLY_API_KEY，请在 API/.env 中填写。")
-    if provider and effective_protocol(provider, model) == "gemini":
+    # APIMART exposes Gemini-named models through its OpenAI-compatible API;
+    # sending x-goog-api-key there causes authentication failures.
+    if provider and effective_protocol(provider, model) == "gemini" and not is_apimart_provider(provider):
         headers = {"Accept": "application/json", "x-goog-api-key": api_key}
     else:
         headers = {"Accept": "application/json", "Authorization": bearer_auth_value(api_key)}

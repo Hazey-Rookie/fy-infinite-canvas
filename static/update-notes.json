@@ -1,14 +1,14 @@
 {
-  "version": "2026.07.23",
-  "updated_at": "2026-07-23T21:50:36+08:00",
+  "version": "2026.07.28.1",
+  "updated_at": "2026-07-29T00:00:00+08:00",
   "items": [
     {
-      "type": "feature",
-      "text": "修复即梦CLI报错，新增5.0pro和SD2.0 mini协议，新增图片2k/4k/8k放大选项"
+      "type": "fix",
+      "text": "修复 APIMART Gemini 模型请求头不兼容导致的接口报错。"
     },
     {
-      "type": "feature",
-      "text": "新增土豆API协议"
+      "type": "improvement",
+      "text": "优化画布高清图片懒加载，仅在缩放到可读范围且图片靠近视口时加载原图。"
     }
   ]
 }

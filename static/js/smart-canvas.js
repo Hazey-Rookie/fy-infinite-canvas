@@ -563,9 +563,11 @@ function bindSmartPreviewImageFallbacks(root=document){
     });
 }
 const SMART_SELECTED_HIGH_RES_DELAY = 320;
+const SMART_HIGH_RES_ZOOM_THRESHOLD = 0.86;
 let smartSelectedHighResTimer = 0;
 let smartSelectedHighResSeq = 0;
 let smartSelectedHighResNodeIds = new Set();
+let smartImageResolutionSyncTimer = 0;
 const smartSelectedHighResLoaded = new Set();
 const smartSelectedHighResLoading = new Map();
 function smartImageEditorIsOpen(){
@@ -600,20 +602,30 @@ function smartNodeElementsByIds(ids){
 }
 function smartNodeElementsForHighResSync(root){
     if(root && root !== world) return [root];
-    const ids = new Set([...smartSelectedHighResNodeIds, ...selectedNodeIds()]);
-    return smartNodeElementsByIds(ids);
+    return [world];
+}
+function smartViewportWantsHighRes(){
+    return Number(viewport?.scale || 1) >= SMART_HIGH_RES_ZOOM_THRESHOLD;
+}
+function smartImageNearViewport(img){
+    if(!img?.isConnected || !shell) return false;
+    const shellRect = shell.getBoundingClientRect();
+    const rect = img.getBoundingClientRect();
+    const margin = 220;
+    return rect.right >= shellRect.left - margin
+        && rect.left <= shellRect.right + margin
+        && rect.bottom >= shellRect.top - margin
+        && rect.top <= shellRect.bottom + margin;
 }
 function syncSmartSelectedImageResolution(root=null){
     const selectedImages = [];
+    const wantHighRes = smartViewportWantsHighRes();
     smartNodeElementsForHighResSync(root).forEach(scope => {
-        const nodeEl = scope?.classList?.contains('image-node') ? scope : scope?.closest?.('.image-node');
-        const nodeId = nodeEl?.dataset?.id || '';
-        const selectedNode = Boolean(nodeId && isNodeSelected(nodeId));
         scope.querySelectorAll?.('img[data-preview-src][data-original-src]').forEach(img => {
             if(img.dataset.previewKind === 'video') return;
             const preview = img.dataset.previewSrc || '';
             const original = img.dataset.originalSrc || '';
-            if(!selectedNode){
+            if(!wantHighRes || !smartImageNearViewport(img)){
                 delete img.dataset.selectedHighResTarget;
                 if(preview && img.getAttribute('src') !== preview) img.src = preview;
                 return;
@@ -631,7 +643,6 @@ function syncSmartSelectedImageResolution(root=null){
     });
     if(smartSelectedHighResTimer) clearTimeout(smartSelectedHighResTimer);
     const seq = ++smartSelectedHighResSeq;
-    smartSelectedHighResNodeIds = new Set(selectedNodeIds());
     if(!selectedImages.length || smartImageEditorIsOpen()) return;
     smartSelectedHighResTimer = setTimeout(async () => {
         smartSelectedHighResTimer = 0;
@@ -640,11 +651,17 @@ function syncSmartSelectedImageResolution(root=null){
         if(seq !== smartSelectedHighResSeq || smartImageEditorIsOpen()) return;
         selectedImages.forEach(({img, target}) => {
             if(!img.isConnected || img.dataset.selectedHighResTarget !== target) return;
-            const nodeEl = img.closest('.image-node');
-            if(!nodeEl?.dataset?.id || !isNodeSelected(nodeEl.dataset.id)) return;
+            if(!smartViewportWantsHighRes() || !smartImageNearViewport(img)) return;
             if(smartSelectedHighResLoaded.has(target) && img.getAttribute('src') !== target) img.src = target;
         });
     }, SMART_SELECTED_HIGH_RES_DELAY);
+}
+function scheduleSmartImageResolutionSync(root=world, delay=120){
+    if(smartImageResolutionSyncTimer) clearTimeout(smartImageResolutionSyncTimer);
+    smartImageResolutionSyncTimer = setTimeout(() => {
+        smartImageResolutionSyncTimer = 0;
+        syncSmartSelectedImageResolution(root);
+    }, Math.max(0, Number(delay) || 0));
 }
 function cloneSmartSettings(source=settings){
     try {
@@ -2052,6 +2069,7 @@ function arrangeSelectedSmartNodes(){
 }
 function applyViewport(){
     world.style.transform = `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`;
+    scheduleSmartImageResolutionSync(world, 120);
     // world 被 transform:scale 缩放后，其内部带 backdrop-filter 的卡片（参数设置/合成卡等）
     // 会被部分浏览器（Chrome/Edge 等 Blink 内核）当作独立合成层先按 1x 栅格化、再整体缩放，
     // 缩小时位图被降采样 → 组件发虚。缩放态下关闭这些 backdrop-filter（底色本身已接近不透明，

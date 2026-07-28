@@ -1,13 +1,16 @@
 import base64
 import asyncio
+from contextlib import closing
 import hashlib
 import hmac
 import json
 import os
 import secrets
+import sqlite3
 import time
 import urllib.parse
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 import httpx
@@ -148,6 +151,9 @@ class AuthSettings:
     roles_table_id: str
     cookie_secure: bool
     default_role: str
+    local_auth_enabled: bool = True
+    auth_db_path: str = ""
+    permission_store: str = "bitable"
 
     @classmethod
     def from_env(cls) -> "AuthSettings":
@@ -173,6 +179,9 @@ class AuthSettings:
             roles_table_id=os.getenv("FEISHU_BITABLE_ROLES_TABLE_ID", "").strip(),
             cookie_secure=_bool_env("FY_COOKIE_SECURE", False),
             default_role="member",
+            local_auth_enabled=_bool_env("FY_LOCAL_AUTH_ENABLED", True),
+            auth_db_path=os.getenv("FY_AUTH_DB_PATH", "").strip(),
+            permission_store=os.getenv("FY_PERMISSION_STORE", "local").strip().lower() or "local",
         )
 
     @property
@@ -203,6 +212,149 @@ class AuthSettings:
             "FEISHU_BITABLE_ROLES_TABLE_ID": self.roles_table_id,
         }
         return [key for key, value in values.items() if not value]
+
+
+def _password_hash(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    iterations = 310_000
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
+    return f"pbkdf2_sha256${iterations}${_b64encode(salt)}${_b64encode(digest)}"
+
+
+def _password_matches(password: str, encoded: str) -> bool:
+    try:
+        algorithm, iterations, salt, expected = encoded.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        actual = hashlib.pbkdf2_hmac(
+            "sha256", password.encode("utf-8"), _b64decode(salt), int(iterations)
+        )
+        return hmac.compare_digest(_b64encode(actual), expected)
+    except (TypeError, ValueError):
+        return False
+
+
+LOCAL_ACCOUNT_VALIDITY_DAYS = 30
+
+
+def _expiry_timestamp(value: Any = None) -> float:
+    if value in (None, ""):
+        return time.time() + LOCAL_ACCOUNT_VALIDITY_DAYS * 24 * 60 * 60
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = _field_text(value)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError("到期日期格式无效") from exc
+    if len(text) == 10:
+        parsed = parsed + timedelta(days=1) - timedelta(seconds=1)
+    return parsed.timestamp()
+
+
+class LocalAccountStore:
+    """Small SQLite store for non-Feishu users; secrets never leave this process."""
+
+    def __init__(self, settings: AuthSettings):
+        configured = settings.auth_db_path or os.getenv("FY_AUTH_DB_PATH", "").strip()
+        self.path = configured or os.path.join(os.path.dirname(__file__), "data", "fy_auth.db")
+
+    def _connect(self) -> sqlite3.Connection:
+        directory = os.path.dirname(os.path.abspath(self.path))
+        os.makedirs(directory, exist_ok=True)
+        conn = sqlite3.connect(self.path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS local_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                display_name TEXT NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'guest',
+                status TEXT NOT NULL DEFAULT 'active',
+                tenant_key TEXT NOT NULL DEFAULT '',
+                expires_at REAL NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )"""
+        )
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(local_accounts)").fetchall()}
+        if "expires_at" not in columns:
+            conn.execute("ALTER TABLE local_accounts ADD COLUMN expires_at REAL")
+            conn.execute(
+                "UPDATE local_accounts SET expires_at = ? WHERE expires_at IS NULL",
+                (_expiry_timestamp(),),
+            )
+        conn.commit()
+        return conn
+
+    @staticmethod
+    def _disable_expired(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "UPDATE local_accounts SET status = 'disabled', updated_at = ? WHERE status = 'active' AND expires_at <= ?",
+            (time.time(), time.time()),
+        )
+        conn.commit()
+
+    @staticmethod
+    def _row(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        result = dict(row)
+        result.pop("password_hash", None)
+        return result
+
+    def get(self, account_id: int) -> Optional[Dict[str, Any]]:
+        with closing(self._connect()) as conn:
+            self._disable_expired(conn)
+            row = conn.execute("SELECT * FROM local_accounts WHERE id = ?", (int(account_id),)).fetchone()
+        return self._row(row)
+
+    def authenticate(self, username: str, password: str) -> Optional[Dict[str, Any]]:
+        with closing(self._connect()) as conn:
+            self._disable_expired(conn)
+            row = conn.execute("SELECT * FROM local_accounts WHERE username = ?", (username.strip(),)).fetchone()
+        if row is None or row["status"] != "active" or not _password_matches(password, row["password_hash"]):
+            return None
+        return self._row(row)
+
+    def create(self, username: str, display_name: str, password: str, role: str, tenant_key: str = "", expires_at: Any = None) -> Dict[str, Any]:
+        now = time.time()
+        expires_at_value = _expiry_timestamp(expires_at)
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                "INSERT INTO local_accounts (username, display_name, password_hash, role, tenant_key, expires_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (username.strip(), display_name.strip(), _password_hash(password), role, tenant_key.strip(), expires_at_value, now, now),
+            )
+            account_id = cursor.lastrowid
+            conn.commit()
+        return self.get(int(account_id)) or {}
+
+    def list(self) -> List[Dict[str, Any]]:
+        with closing(self._connect()) as conn:
+            self._disable_expired(conn)
+            rows = conn.execute("SELECT * FROM local_accounts ORDER BY id").fetchall()
+        return [self._row(row) for row in rows if row is not None]
+
+    def update(self, account_id: int, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        allowed = {key: fields[key] for key in ("display_name", "role", "status", "tenant_key", "expires_at") if key in fields}
+        if "password" in fields and fields["password"]:
+            allowed["password_hash"] = _password_hash(str(fields["password"]))
+        if not allowed:
+            return self.get(account_id)
+        allowed["updated_at"] = time.time()
+        assignments = ", ".join(f"{key} = ?" for key in allowed)
+        with closing(self._connect()) as conn:
+            conn.execute(f"UPDATE local_accounts SET {assignments} WHERE id = ?", (*allowed.values(), int(account_id)))
+            conn.commit()
+        return self.get(account_id)
+
+    def delete(self, account_id: int) -> bool:
+        with closing(self._connect()) as conn:
+            cursor = conn.execute("DELETE FROM local_accounts WHERE id = ?", (int(account_id),))
+            conn.commit()
+        return cursor.rowcount > 0
 
 
 class SignedTokenCodec:
@@ -537,12 +689,194 @@ class BitablePermissionStore:
         return await self._write_record(self.settings.roles_table_id, fields, existing.get("record_id") or "")
 
 
+class LocalPermissionStore:
+    """Application-owned permission store; it deliberately has no Feishu API client."""
+
+    def __init__(self, settings: AuthSettings):
+        configured = settings.auth_db_path or os.getenv("FY_AUTH_DB_PATH", "").strip()
+        self.path = configured or os.path.join(os.path.dirname(__file__), "data", "fy_auth.db")
+        self._cache: Optional[Dict[str, Any]] = None
+        self._cache_expires_at = 0.0
+
+    def _connect(self) -> sqlite3.Connection:
+        directory = os.path.dirname(os.path.abspath(self.path))
+        os.makedirs(directory, exist_ok=True)
+        conn = sqlite3.connect(self.path, timeout=10)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS permission_members (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_key TEXT NOT NULL DEFAULT '',
+                open_id TEXT NOT NULL DEFAULT '',
+                user_id TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                email TEXT NOT NULL DEFAULT '',
+                mobile TEXT NOT NULL DEFAULT '',
+                department_ids TEXT NOT NULL DEFAULT '[]',
+                role TEXT NOT NULL DEFAULT 'member',
+                status TEXT NOT NULL DEFAULT 'active',
+                updated_at REAL NOT NULL,
+                UNIQUE (tenant_key, open_id, user_id)
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS permission_roles (
+                name TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                permissions TEXT NOT NULL DEFAULT '[]',
+                system INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL
+            )"""
+        )
+        conn.commit()
+        return conn
+
+    @staticmethod
+    def _member(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        result = dict(row)
+        result["department_ids"] = _json_list(result.get("department_ids"))
+        result.pop("id", None)
+        return result
+
+    @staticmethod
+    def _role(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        result = dict(row)
+        result["permissions"] = _json_list(result.get("permissions"))
+        result["system"] = bool(result.get("system"))
+        return result
+
+    async def snapshot(self, refresh: bool = False) -> Dict[str, Any]:
+        if not refresh and self._cache and time.time() < self._cache_expires_at:
+            return self._cache
+        with closing(self._connect()) as conn:
+            member_rows = conn.execute("SELECT * FROM permission_members ORDER BY id").fetchall()
+            role_rows = conn.execute("SELECT * FROM permission_roles ORDER BY name").fetchall()
+        roles = {name: dict(role) for name, role in DEFAULT_ROLES.items()}
+        for row in role_rows:
+            role = self._role(row)
+            if role and role.get("name"):
+                roles[role["name"]] = role
+        self._cache = {
+            "members": [self._member(row) for row in member_rows],
+            "roles": roles,
+            "source": "local",
+        }
+        self._cache_expires_at = time.time() + 30
+        return self._cache
+
+    @property
+    def configured(self) -> bool:
+        return True
+
+    async def member_for(self, user: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        candidates = {str(user.get(key) or "").strip() for key in ("open_id", "user_id", "email", "mobile")}
+        candidates.discard("")
+        tenant_key = _field_text(user.get("tenant_key"))
+        snapshot = await self.snapshot()
+        for member in snapshot["members"]:
+            if tenant_key and member.get("tenant_key") and member.get("tenant_key") != tenant_key:
+                continue
+            identifiers = {str(member.get(key) or "").strip() for key in ("open_id", "user_id", "email", "mobile")}
+            if candidates.intersection(identifiers):
+                return member
+        return None
+
+    async def role_map(self) -> Dict[str, Dict[str, Any]]:
+        return (await self.snapshot())["roles"]
+
+    async def save_member(self, member: Dict[str, Any]) -> Dict[str, Any]:
+        now = time.time()
+        normalized = {
+            "tenant_key": _field_text(member.get("tenant_key")),
+            "open_id": _field_text(member.get("open_id")),
+            "user_id": _field_text(member.get("user_id")),
+            "name": _field_text(member.get("name")),
+            "email": _field_text(member.get("email")),
+            "mobile": _field_text(member.get("mobile")),
+            "department_ids": _json_list(member.get("department_ids")),
+            "role": _field_text(member.get("role") or "member").lower(),
+            "status": _field_text(member.get("status") or "active").lower(),
+        }
+        with closing(self._connect()) as conn:
+            existing = await self.member_for(normalized)
+            if existing:
+                conn.execute(
+                    """UPDATE permission_members SET tenant_key=?, open_id=?, user_id=?, name=?, email=?, mobile=?,
+                       department_ids=?, role=?, status=?, updated_at=? WHERE tenant_key=? AND open_id=? AND user_id=?""",
+                    (
+                        normalized["tenant_key"], normalized["open_id"], normalized["user_id"], normalized["name"],
+                        normalized["email"], normalized["mobile"], json.dumps(normalized["department_ids"], ensure_ascii=False),
+                        normalized["role"], normalized["status"], now, existing.get("tenant_key", ""),
+                        existing.get("open_id", ""), existing.get("user_id", ""),
+                    ),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO permission_members
+                       (tenant_key, open_id, user_id, name, email, mobile, department_ids, role, status, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        normalized["tenant_key"], normalized["open_id"], normalized["user_id"], normalized["name"],
+                        normalized["email"], normalized["mobile"], json.dumps(normalized["department_ids"], ensure_ascii=False),
+                        normalized["role"], normalized["status"], now,
+                    ),
+                )
+            conn.commit()
+        self._cache = None
+        return normalized
+
+    async def delete_member(self, member: Dict[str, Any]) -> bool:
+        existing = await self.member_for(member)
+        if not existing:
+            return False
+        with closing(self._connect()) as conn:
+            cursor = conn.execute(
+                "DELETE FROM permission_members WHERE tenant_key=? AND open_id=? AND user_id=?",
+                (existing.get("tenant_key", ""), existing.get("open_id", ""), existing.get("user_id", "")),
+            )
+            conn.commit()
+        self._cache = None
+        return cursor.rowcount > 0
+
+    async def save_role(self, role: Dict[str, Any]) -> Dict[str, Any]:
+        name = _field_text(role.get("name")).lower()
+        normalized = {
+            "name": name,
+            "display_name": _field_text(role.get("display_name")) or name,
+            "permissions": _json_list(role.get("permissions")),
+            "system": bool(role.get("system")),
+            "updated_at": time.time(),
+        }
+        with closing(self._connect()) as conn:
+            conn.execute(
+                """INSERT INTO permission_roles (name, display_name, permissions, system, updated_at)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(name) DO UPDATE SET display_name=excluded.display_name,
+                   permissions=excluded.permissions, system=excluded.system, updated_at=excluded.updated_at""",
+                (name, normalized["display_name"], json.dumps(normalized["permissions"], ensure_ascii=False), normalized["system"], normalized["updated_at"]),
+            )
+            conn.commit()
+        self._cache = None
+        return normalized
+
+
 class AuthService:
     def __init__(self, settings: Optional[AuthSettings] = None):
         self.settings = settings or AuthSettings.from_env()
         self.codec = SignedTokenCodec(self.settings.session_secret)
         self.feishu = FeishuClient(self.settings)
-        self.store = BitablePermissionStore(self.settings, self.feishu)
+        self.store = (
+            LocalPermissionStore(self.settings)
+            if self.settings.permission_store == "local"
+            else BitablePermissionStore(self.settings, self.feishu)
+        )
+        self.local_accounts = LocalAccountStore(self.settings)
+        self._local_login_failures: Dict[str, List[float]] = {}
         self._organization_cache: Dict[str, Any] = {}
         self._organization_expires_at = 0.0
 
@@ -552,9 +886,22 @@ class AuthService:
 
     async def resolve_profile(self, user: Dict[str, Any]) -> Dict[str, Any]:
         profile = dict(user)
+        local_account = None
+        if profile.get("auth_type") == "local" or profile.get("local_account_id"):
+            if not self.settings.local_auth_enabled:
+                return {"status": "disabled", "auth_type": "local"}
+            try:
+                local_account = self.local_accounts.get(int(profile.get("local_account_id") or 0))
+            except (TypeError, ValueError):
+                local_account = None
+            if not local_account:
+                return {"status": "disabled", "auth_type": "local"}
+            profile.update(local_account)
+            profile["auth_type"] = "local"
+            profile["name"] = profile.get("name") or profile.get("display_name") or profile.get("username")
         super_admin = self.is_super_admin(profile)
         member = None
-        if self.store.configured:
+        if not local_account and self.store.configured:
             try:
                 member = await self.store.member_for(profile)
             except FeishuAPIError as exc:
@@ -576,9 +923,31 @@ class AuthService:
             "permissions": sorted(set(permissions)),
             "is_super_admin": super_admin,
             "read_only": role_name == "guest" or "action:write" not in permissions,
-            "status": "active" if super_admin else (member or {}).get("status") or "active",
+            "status": "active" if super_admin else (
+                (local_account or {}).get("status") if local_account else (member or {}).get("status")
+            ) or "active",
         })
         return profile
+
+    async def authenticate_local(self, username: str, password: str) -> Optional[Dict[str, Any]]:
+        if not self.settings.local_auth_enabled:
+            return None
+        key = username.strip().casefold()
+        now = time.time()
+        recent = [item for item in self._local_login_failures.get(key, []) if now - item < 600]
+        if len(recent) >= 5:
+            self._local_login_failures[key] = recent
+            return None
+        account = self.local_accounts.authenticate(username, password)
+        if not account:
+            recent.append(now)
+            self._local_login_failures[key] = recent[-5:]
+            return None
+        self._local_login_failures.pop(key, None)
+        return await self.resolve_profile({
+            "auth_type": "local",
+            "local_account_id": account["id"],
+        })
 
     async def current_user(self, request: Request) -> Optional[Dict[str, Any]]:
         cached = getattr(request.state, "fy_user", None)
@@ -588,7 +957,12 @@ class AuthService:
         payload = self.codec.decode(token) if token else None
         if not payload or payload.get("kind") != "session":
             return None
-        user = await self.resolve_profile(payload.get("user") or {})
+        stored_user = dict(payload.get("user") or {})
+        if payload.get("auth_type"):
+            stored_user["auth_type"] = payload.get("auth_type")
+        if payload.get("local_account_id"):
+            stored_user["local_account_id"] = payload.get("local_account_id")
+        user = await self.resolve_profile(stored_user)
         if user.get("status") == "disabled":
             return None
         request.state.fy_user = user
@@ -603,10 +977,13 @@ class AuthService:
         return permission in set(user.get("permissions") or [])
 
     def public_config(self) -> Dict[str, Any]:
+        permission_store = "local" if isinstance(self.store, LocalPermissionStore) else "bitable"
         return {
             "sso_enabled": True,
             "sso_configured": self.settings.sso_configured,
-            "bitable_enabled": self.settings.bitable_configured,
+            "local_auth_enabled": self.settings.local_auth_enabled,
+            "permission_store": permission_store,
+            "bitable_enabled": permission_store == "bitable" and self.settings.bitable_configured,
             "missing_sso_fields": self.settings.missing_sso_fields(),
             "missing_bitable_fields": self.settings.missing_bitable_fields(),
             "default_role": self.settings.default_role,
@@ -716,8 +1093,34 @@ def register_auth(app, service: AuthService) -> None:
     async def auth_me(request: Request):
         user = await service.current_user(request)
         if not user:
-            raise HTTPException(status_code=401, detail="请使用飞书登录")
+            raise HTTPException(status_code=401, detail="请先登录")
         return {"user": user, "config": service.public_config()}
+
+    async def local_login(request: Request, payload: Dict[str, Any] = Body(...)):
+        if not service.settings.local_auth_enabled:
+            raise HTTPException(status_code=404, detail="本地账号登录未启用")
+        username = _field_text(payload.get("username"))
+        password = _field_text(payload.get("password"))
+        if not username or not password:
+            raise HTTPException(status_code=400, detail="请输入账号和密码")
+        user = await service.authenticate_local(username, password)
+        if not user:
+            raise HTTPException(status_code=401, detail="账号或密码错误，或账号已停用")
+        session = service.codec.encode({
+            "kind": "session",
+            "auth_type": "local",
+            "local_account_id": user["id"],
+        }, 12 * 60 * 60)
+        response = JSONResponse({"ok": True, "return_to": _return_path(payload.get("return_to") or "/")})
+        response.set_cookie(
+            SESSION_COOKIE,
+            session,
+            max_age=12 * 60 * 60,
+            httponly=True,
+            secure=service.settings.cookie_secure,
+            samesite="lax",
+        )
+        return response
 
     async def auth_login(request: Request, return_to: str = "/"):
         if not service.settings.sso_configured:
@@ -776,6 +1179,89 @@ def register_auth(app, service: AuthService) -> None:
         response = RedirectResponse("/static/login.html", status_code=302)
         response.delete_cookie(SESSION_COOKIE)
         return response
+
+    async def local_accounts(request: Request):
+        user = await service.current_user(request)
+        if not user or not user.get("is_super_admin"):
+            raise HTTPException(status_code=403, detail="只有超管可以管理外部账号")
+        return {"accounts": service.local_accounts.list()}
+
+    async def create_local_account(request: Request, payload: Dict[str, Any] = Body(...)):
+        user = await service.current_user(request)
+        if not user or not user.get("is_super_admin"):
+            raise HTTPException(status_code=403, detail="只有超管可以管理外部账号")
+        username = _field_text(payload.get("username"))
+        display_name = _field_text(payload.get("display_name") or payload.get("name"))
+        password = _field_text(payload.get("password"))
+        role = _field_text(payload.get("role") or "guest").lower()
+        if len(username) < 3 or len(username) > 64 or not all(char.isalnum() or char in "._-@+" for char in username):
+            raise HTTPException(status_code=400, detail="账号格式无效")
+        if len(display_name) > 80 or not display_name:
+            raise HTTPException(status_code=400, detail="请填写展示名称")
+        if len(password) < 8:
+            raise HTTPException(status_code=400, detail="密码至少需要 8 个字符")
+        try:
+            expires_at = _expiry_timestamp(payload.get("expires_at"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if expires_at <= time.time():
+            raise HTTPException(status_code=400, detail="到期日期必须晚于当前时间")
+        try:
+            roles = await service.store.role_map() if service.store.configured else DEFAULT_ROLES
+            if role not in roles:
+                raise HTTPException(status_code=400, detail="账号角色不存在")
+            return service.local_accounts.create(
+                username, display_name, password, role, _field_text(user.get("tenant_key")), expires_at
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="账号已存在") from exc
+
+    async def update_local_account(request: Request, account_id: int, payload: Dict[str, Any] = Body(...)):
+        user = await service.current_user(request)
+        if not user or not user.get("is_super_admin"):
+            raise HTTPException(status_code=403, detail="只有超管可以管理外部账号")
+        existing = service.local_accounts.get(account_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail="账号不存在")
+        fields = {}
+        if "display_name" in payload:
+            display_name = _field_text(payload.get("display_name"))
+            if not display_name or len(display_name) > 80:
+                raise HTTPException(status_code=400, detail="展示名称无效")
+            fields["display_name"] = display_name
+        if "role" in payload:
+            role = _field_text(payload.get("role")).lower()
+            roles = await service.store.role_map() if service.store.configured else DEFAULT_ROLES
+            if role not in roles:
+                raise HTTPException(status_code=400, detail="账号角色不存在")
+            fields["role"] = role
+        if "status" in payload:
+            status = _field_text(payload.get("status")).lower()
+            if status not in {"active", "disabled"}:
+                raise HTTPException(status_code=400, detail="账号状态只能是 active 或 disabled")
+            fields["status"] = status
+        if "password" in payload:
+            password = _field_text(payload.get("password"))
+            if len(password) < 8:
+                raise HTTPException(status_code=400, detail="密码至少需要 8 个字符")
+            fields["password"] = password
+        if "expires_at" in payload:
+            try:
+                expires_at = _expiry_timestamp(payload.get("expires_at"))
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if expires_at <= time.time():
+                raise HTTPException(status_code=400, detail="到期日期必须晚于当前时间")
+            fields["expires_at"] = expires_at
+        return service.local_accounts.update(account_id, fields)
+
+    async def delete_local_account(request: Request, account_id: int):
+        user = await service.current_user(request)
+        if not user or not user.get("is_super_admin"):
+            raise HTTPException(status_code=403, detail="只有超管可以管理外部账号")
+        if not service.local_accounts.delete(account_id):
+            raise HTTPException(status_code=404, detail="账号不存在")
+        return {"deleted": True}
 
     async def organization(request: Request, refresh: bool = False):
         user = await service.current_user(request)
@@ -842,10 +1328,15 @@ def register_auth(app, service: AuthService) -> None:
 
     app.add_api_route("/api/auth/config", auth_config, methods=["GET"])
     app.add_api_route("/api/auth/me", auth_me, methods=["GET"])
+    app.add_api_route("/api/auth/local/login", local_login, methods=["POST"])
     app.add_api_route("/api/auth/feishu/login", auth_login, methods=["GET"])
     app.add_api_route("/auth/callback", auth_callback, methods=["GET"])
     app.add_api_route("/api/auth/feishu/callback", auth_callback, methods=["GET"])
     app.add_api_route("/api/auth/logout", auth_logout, methods=["GET", "POST"])
+    app.add_api_route("/api/admin/local-accounts", local_accounts, methods=["GET"])
+    app.add_api_route("/api/admin/local-accounts", create_local_account, methods=["POST"])
+    app.add_api_route("/api/admin/local-accounts/{account_id}", update_local_account, methods=["PATCH"])
+    app.add_api_route("/api/admin/local-accounts/{account_id}", delete_local_account, methods=["DELETE"])
     app.add_api_route("/api/admin/organization", organization, methods=["GET"])
     app.add_api_route("/api/admin/members/{open_id}", save_member, methods=["PUT"])
     app.add_api_route("/api/admin/members/{open_id}", delete_member, methods=["DELETE"])
@@ -855,6 +1346,7 @@ def register_auth(app, service: AuthService) -> None:
 PUBLIC_AUTH_PATHS = {
     "/api/auth/config",
     "/api/auth/me",
+    "/api/auth/local/login",
     "/api/auth/feishu/login",
     "/auth/callback",
     "/api/auth/feishu/callback",
@@ -868,6 +1360,14 @@ SENSITIVE_STATIC_PERMISSIONS = {
 }
 DISABLED_LOCAL_STATIC_PATHS = {
     "/static/zimage.html", "/static/enhance.html", "/static/klein.html", "/static/angle.html",
+}
+SUPER_ADMIN_UPDATE_PATHS = {
+    "/api/check-update",
+    "/api/update-connectivity",
+    "/api/update-connectivity/probe",
+    "/api/update-backups",
+    "/api/update-from-github",
+    "/api/update-rollback",
 }
 
 
@@ -909,6 +1409,8 @@ async def auth_middleware(service: AuthService, request: Request, call_next):
     static_permission = SENSITIVE_STATIC_PERMISSIONS.get(path)
     if static_permission and not service.has_permission(user, static_permission):
         return JSONResponse({"detail": "没有访问该页面的权限"}, status_code=403)
+    if path in SUPER_ADMIN_UPDATE_PATHS and not user.get("is_super_admin"):
+        return JSONResponse({"detail": "仅平台超管可查看或执行版本更新"}, status_code=403)
     required = _management_permission(path, method)
     if required and not service.has_permission(user, required):
         return JSONResponse({"detail": "没有修改设置的权限"}, status_code=403)

@@ -1,0 +1,18 @@
+{
+  "version": "0.1.1",
+  "updated_at": "2026-07-29",
+  "items": [
+    {
+      "type": "feature",
+      "text": "支持企业账号和外部账号登录。"
+    },
+    {
+      "type": "feature",
+      "text": "支持成员权限和账号有效期管理。"
+    },
+    {
+      "type": "improvement",
+      "text": "优化版本提示和常用入口体验。"
+    }
+  ]
+}

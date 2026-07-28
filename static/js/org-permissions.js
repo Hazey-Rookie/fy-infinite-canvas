@@ -8,17 +8,19 @@ const CAPABILITY_PERMISSIONS = [
     ['action:read','查看内容'],['action:write','生成与修改'],['settings:api:manage','修改 API 设置'],
     ['settings:more:manage','修改更多设置'],['organization:view','查看组织架构'],
 ];
-const state = {auth:null,departments:[],users:[],roles:[],selectedRole:'',search:''};
+const state = {auth:null,departments:[],users:[],roles:[],localAccounts:[],selectedRole:'',search:''};
 const elements = {
     sourceBadge:document.getElementById('sourceBadge'),identityLabel:document.getElementById('identityLabel'),notice:document.getElementById('notice'),
     refreshBtn:document.getElementById('refreshBtn'),memberSearch:document.getElementById('memberSearch'),memberSummary:document.getElementById('memberSummary'),
     memberRows:document.getElementById('memberRows'),memberEmpty:document.getElementById('memberEmpty'),roleList:document.getElementById('roleList'),
     newRoleBtn:document.getElementById('newRoleBtn'),roleName:document.getElementById('roleName'),roleDisplayName:document.getElementById('roleDisplayName'),
     saveRoleBtn:document.getElementById('saveRoleBtn'),permissionGroups:document.getElementById('permissionGroups'),toast:document.getElementById('toast'),
+    externalTab:document.getElementById('externalTab'),externalForm:document.getElementById('externalAccountForm'),externalRows:document.getElementById('externalAccountRows'),externalSummary:document.getElementById('externalSummary'),
+    externalUsername:document.getElementById('externalUsername'),externalDisplayName:document.getElementById('externalDisplayName'),externalPassword:document.getElementById('externalPassword'),externalRole:document.getElementById('externalRole'),externalExpiresAt:document.getElementById('externalExpiresAt'),
 };
 
 function escapeHtml(value){return String(value??'').replace(/[&<>'"]/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]));}
-function canManage(){return Boolean(state.auth?.user?.is_super_admin&&state.auth?.config?.bitable_enabled);}
+function canManage(){return Boolean(state.auth?.user?.is_super_admin&&(state.auth?.config?.permission_store==='local'||state.auth?.config?.bitable_enabled));}
 async function api(url,options={}){
     const response=await fetch(url,{...options,cache:'no-store',headers:{'Content-Type':'application/json',...(options.headers||{})}});
     const payload=await response.json().catch(()=>({}));
@@ -30,6 +32,9 @@ function showToast(message,error=false){clearTimeout(toastTimer);elements.toast.
 function showNotice(message,error=false){elements.notice.textContent=message||'';elements.notice.classList.toggle('error',error);elements.notice.hidden=!message;}
 function departmentMap(){const map=new Map();state.departments.forEach(item=>{const id=String(item.open_department_id||item.department_id||'');if(id)map.set(id,item.name||id);});return map;}
 function roleOptions(selected){return state.roles.map(role=>`<option value="${escapeHtml(role.name)}" ${role.name===selected?'selected':''}>${escapeHtml(role.display_name||role.name)}</option>`).join('');}
+function localDateValue(timestamp){if(!timestamp)return '';const date=new Date(Number(timestamp)*1000);return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;}
+function defaultExpiryDate(){const date=new Date();date.setDate(date.getDate()+30);return localDateValue(date.getTime()/1000);}
+function setExpiryPreset(days){const date=new Date();date.setDate(date.getDate()+Number(days));elements.externalExpiresAt.value=localDateValue(date.getTime()/1000);elements.externalForm.querySelectorAll('[data-expiry-days]').forEach(button=>button.classList.toggle('active',Number(button.dataset.expiryDays)===Number(days)));}
 function renderMembers(){
     const departments=departmentMap();const query=state.search.trim().toLowerCase();
     const users=state.users.filter(user=>{if(!query)return true;const names=(user.department_ids||[]).map(id=>departments.get(String(id))||id).join(' ');return [user.name,user.email,user.mobile,names].join(' ').toLowerCase().includes(query);});
@@ -40,17 +45,19 @@ function renderRoleList(){elements.roleList.innerHTML=state.roles.map(role=>`<bu
 function selectedRole(){return state.roles.find(role=>role.name===state.selectedRole)||null;}
 function permissionGroup(title,items,selected){return `<section class="permission-group"><h2>${escapeHtml(title)}</h2><div class="permission-options">${items.map(([key,label])=>`<label class="permission-option"><input type="checkbox" value="${escapeHtml(key)}" ${selected.has(key)?'checked':''} ${canManage()?'':'disabled'}><span>${escapeHtml(label)}</span></label>`).join('')}</div></section>`;}
 function renderRoleEditor(){const role=selectedRole();const selected=new Set(role?.permissions||[]);elements.roleName.value=role?.name||'';elements.roleDisplayName.value=role?.display_name||'';elements.roleName.disabled=!canManage()||Boolean(role);elements.roleDisplayName.disabled=!canManage();elements.saveRoleBtn.disabled=!canManage();elements.newRoleBtn.disabled=!canManage();elements.permissionGroups.innerHTML=permissionGroup('菜单',MENU_PERMISSIONS,selected)+permissionGroup('操作能力',CAPABILITY_PERMISSIONS,selected);}
-function renderAll(){renderMembers();renderRoleList();renderRoleEditor();}
+function renderExternal(){if(!elements.externalRows)return;elements.externalRole.innerHTML=roleOptions(elements.externalRole.value||'guest');if(!elements.externalExpiresAt.value)elements.externalExpiresAt.value=defaultExpiryDate();elements.externalSummary.textContent=`${state.localAccounts.length} 个账号`;elements.externalRows.innerHTML=state.localAccounts.map(account=>`<tr data-account-id="${account.id}"><td><div class="member-name">${escapeHtml(account.display_name)}</div><div class="member-sub">${escapeHtml(account.username)}</div></td><td>${escapeHtml(account.role)}</td><td><span class="account-status ${account.status==='active'?'active':''}">${account.status==='active'?'启用':'停用'}</span></td><td><div class="expiry-editor"><input data-field="expires-at" type="date" value="${localDateValue(account.expires_at)}"><button class="table-command" type="button" data-action="save-expiry">保存</button></div></td><td><div class="account-actions"><button class="table-command" type="button" data-action="toggle-status" data-status="${account.status}">${account.status==='active'?'停用':'启用'}</button><button class="danger-command" type="button" data-action="delete">删除</button></div></td></tr>`).join('');}
+function renderAll(){renderMembers();renderRoleList();renderRoleEditor();renderExternal();}
 
 async function loadData(refresh=false){
     elements.refreshBtn.disabled=true;showNotice('');
     try{
         state.auth=await api('/api/auth/me');const data=await api(`/api/admin/organization${refresh?'?refresh=true':''}`);
         state.departments=data.departments||[];state.users=data.users||[];state.roles=data.roles||[];
+        if(state.auth.user.is_super_admin && state.auth.config.local_auth_enabled){const accounts=await api('/api/admin/local-accounts');state.localAccounts=accounts.accounts||[];elements.externalTab.hidden=false;}
         if(!state.selectedRole||!state.roles.some(role=>role.name===state.selectedRole))state.selectedRole=state.roles[0]?.name||'';
         elements.identityLabel.textContent=`${state.auth.user.name||'当前用户'} · ${state.auth.user.role}`;
-        elements.sourceBadge.textContent=data.source==='bitable'?'飞书多维表格':'默认权限';elements.sourceBadge.className=`status-badge ${data.source==='bitable'?'live':'warn'}`;
-        if(!state.auth.config.bitable_enabled)showNotice('尚未配置飞书多维表格，当前仅可查看默认角色。');
+        elements.sourceBadge.textContent=data.source==='bitable'?'飞书多维表格':data.source==='local'?'应用权限库':'默认权限';elements.sourceBadge.className=`status-badge ${data.source==='bitable'?'live':'warn'}`;
+        if(data.source==='bitable')showNotice('当前仍在使用飞书多维表格权限数据源。');
         else if(!state.auth.user.is_super_admin)showNotice('当前账号可查看组织架构，只有超管可以修改成员和角色。');
         renderAll();
     }catch(error){showNotice(error.message||String(error),true);}finally{elements.refreshBtn.disabled=false;}
@@ -79,5 +86,9 @@ elements.memberRows.addEventListener('change',event=>{const row=event.target.clo
 elements.memberRows.addEventListener('click',event=>{const button=event.target.closest('[data-action="remove"]');const row=button?.closest('tr[data-user-id]');if(row)removeMember(row);});
 elements.roleList.addEventListener('click',event=>{const item=event.target.closest('[data-role]');if(!item)return;state.selectedRole=item.dataset.role;renderRoleList();renderRoleEditor();});
 elements.newRoleBtn.addEventListener('click',()=>{state.selectedRole='';renderRoleList();renderRoleEditor();elements.roleName.focus();});elements.saveRoleBtn.addEventListener('click',saveRole);
+elements.externalForm?.addEventListener('click',event=>{const preset=event.target.closest('[data-expiry-days]');if(preset)setExpiryPreset(preset.dataset.expiryDays);});
+elements.externalExpiresAt?.addEventListener('change',()=>elements.externalForm.querySelectorAll('[data-expiry-days]').forEach(button=>button.classList.remove('active')));
+elements.externalForm?.addEventListener('submit',async event=>{event.preventDefault();const submit=event.target.querySelector('button[type="submit"]');submit.disabled=true;try{const account=await api('/api/admin/local-accounts',{method:'POST',body:JSON.stringify({username:elements.externalUsername.value,display_name:elements.externalDisplayName.value,password:elements.externalPassword.value,role:elements.externalRole.value,expires_at:elements.externalExpiresAt.value})});state.localAccounts.push(account);event.target.reset();setExpiryPreset(30);renderExternal();showToast('外部账号已创建');}catch(error){showToast(error.message||String(error),true);}finally{submit.disabled=false;}});
+elements.externalRows?.addEventListener('click',async event=>{const button=event.target.closest('[data-action]');const row=button?.closest('tr[data-account-id]');if(!button||!row)return;const accountId=row.dataset.accountId;const action=button.dataset.action;if(action==='delete'&&!window.confirm('确定永久删除该外部账号？此操作不可恢复。'))return;button.disabled=true;try{if(action==='delete'){await api(`/api/admin/local-accounts/${accountId}`,{method:'DELETE'});state.localAccounts=state.localAccounts.filter(item=>String(item.id)!==accountId);renderExternal();showToast('外部账号已删除');return;}const payload=action==='save-expiry'?{expires_at:row.querySelector('[data-field="expires-at"]').value}:{status:button.dataset.status==='active'?'disabled':'active'};const account=await api(`/api/admin/local-accounts/${accountId}`,{method:'PATCH',body:JSON.stringify(payload)});const index=state.localAccounts.findIndex(item=>String(item.id)===String(account.id));if(index>=0)state.localAccounts[index]=account;renderExternal();showToast(action==='save-expiry'?'到期日期已保存':'外部账号状态已更新');}catch(error){button.disabled=false;showToast(error.message||String(error),true);}});
 window.addEventListener('message',event=>{if(event.origin&&event.origin!==location.origin)return;if(event.data?.type==='studio-theme')document.body.classList.toggle('theme-dark',event.data.theme==='dark');});
 loadData();

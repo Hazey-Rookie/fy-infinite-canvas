@@ -2,6 +2,7 @@ import asyncio
 import os
 import sys
 import time
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlparse
@@ -495,6 +496,91 @@ class MiddlewareBoundaryTests(unittest.TestCase):
         response = asyncio.run(logout())
         self.assertEqual(response.status_code, 302)
         self.assertIn('fy_session=""', response.headers.get("set-cookie", ""))
+
+
+class LocalAccountTests(unittest.TestCase):
+    def service(self, directory, **overrides):
+        return AuthService(settings(
+            auth_db_path=os.path.join(directory, "auth.db"),
+            super_admin_ids=["ou_super_admin"],
+            **overrides,
+        ))
+
+    def test_password_is_hashed_and_login_returns_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.service(directory)
+            account = service.local_accounts.create("partner@example.com", "外部协作者", "strong-pass", "guest")
+            self.assertEqual(account["username"], "partner@example.com")
+            self.assertNotIn("password_hash", account)
+            self.assertEqual(asyncio.run(service.authenticate_local("partner@example.com", "strong-pass"))["role"], "guest")
+            self.assertIsNone(asyncio.run(service.authenticate_local("partner@example.com", "wrong-pass")))
+            self.assertAlmostEqual(account["expires_at"], time.time() + 30 * 24 * 60 * 60, delta=10)
+
+    def test_expired_account_is_automatically_disabled_and_can_be_deleted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.service(directory)
+            account = service.local_accounts.create(
+                "expired-partner", "过期协作者", "strong-pass", "guest", expires_at=time.time() - 1,
+            )
+            self.assertIsNone(asyncio.run(service.authenticate_local("expired-partner", "strong-pass")))
+            self.assertEqual(service.local_accounts.get(account["id"])["status"], "disabled")
+            self.assertTrue(service.local_accounts.delete(account["id"]))
+            self.assertIsNone(service.local_accounts.get(account["id"]))
+
+    def test_disabled_account_invalidates_existing_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.service(directory)
+            account = service.local_accounts.create("partner", "外部协作者", "strong-pass", "guest")
+            token = service.codec.encode({"kind": "session", "auth_type": "local", "local_account_id": account["id"]}, 60)
+            request = MiddlewareBoundaryTests.request(method="GET", path="/api/auth/me", cookies={"fy_session": token})
+            self.assertIsNotNone(asyncio.run(service.current_user(request)))
+            service.local_accounts.update(account["id"], {"status": "disabled"})
+            request = MiddlewareBoundaryTests.request(method="GET", path="/api/auth/me", cookies={"fy_session": token})
+            self.assertIsNone(asyncio.run(service.current_user(request)))
+
+    def test_non_super_admin_cannot_manage_local_accounts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.service(directory)
+            service.current_user = AsyncMock(return_value={"is_super_admin": False})
+            app = FastAPI()
+            register_auth(app, service)
+            create = endpoint(app, "/api/admin/local-accounts", "POST")
+            with self.assertRaises(HTTPException) as error:
+                asyncio.run(create(MiddlewareBoundaryTests.request(), {"username": "partner", "display_name": "外部", "password": "strong-pass"}))
+            self.assertEqual(error.exception.status_code, 403)
+
+    def test_super_admin_can_create_and_local_login_sets_cookie(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = self.service(directory)
+            service.current_user = AsyncMock(return_value={"is_super_admin": True, "tenant_key": "tenant_test"})
+            app = FastAPI()
+            register_auth(app, service)
+            create = endpoint(app, "/api/admin/local-accounts", "POST")
+            account = asyncio.run(create(
+                MiddlewareBoundaryTests.request(),
+                {"username": "partner", "display_name": "外部", "password": "strong-pass", "role": "guest"},
+            ))
+            self.assertEqual(account["tenant_key"], "tenant_test")
+            login = endpoint(app, "/api/auth/local/login", "POST")
+            response = asyncio.run(login(
+                MiddlewareBoundaryTests.request(method="POST", path="/api/auth/local/login"),
+                {"username": "partner", "password": "strong-pass", "return_to": "/"},
+            ))
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("fy_session=", response.headers.get("set-cookie", ""))
+
+    def test_local_permission_store_is_selected_without_bitable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service = AuthService(settings(
+                auth_db_path=os.path.join(directory, "auth.db"),
+                permission_store="local",
+                bitable_app_token="bascn_should_not_be_used",
+                members_table_id="tbl_should_not_be_used",
+                roles_table_id="tbl_should_not_be_used",
+            ))
+            self.assertEqual(service.public_config()["permission_store"], "local")
+            self.assertFalse(service.public_config()["bitable_enabled"])
+            self.assertEqual(asyncio.run(service.store.snapshot())["source"], "local")
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ services:
     container_name: infinite-canvas
     restart: unless-stopped
     ports:
-      - "127.0.0.1:3000:3000"
+      - "${FY_BIND_ADDRESS:-127.0.0.1}:${FY_HOST_PORT:-3000}:3000"
     environment:
       TZ: Asia/Shanghai
       PYTHONUNBUFFERED: "1"
