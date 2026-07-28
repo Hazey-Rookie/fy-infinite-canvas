@@ -20,7 +20,7 @@
     <link rel="stylesheet" href="/static/css/tailwind.generated.css?v=2026.07.23.1784828259">
     <script src="/static/vendor/js/lucide.js?v=2026.07.23.1784827847"></script>
     <script src="/static/js/theme.js?v=2026.07.23.1784827832"></script>
-    <script src="/static/js/i18n.js?v=2026.07.23.1784827822"></script>
+    <script src="/static/js/i18n.js?v=2026.07.23.1784831933"></script>
     <script src="/static/js/image-preview.js?v=2026.07.23.1784827827"></script>
     <script src="/static/js/history-bulk-manager.js?v=2026.07.23.1784827821"></script>
     <style>
@@ -472,6 +472,8 @@
         let uploadedPath = "";
         let currentResult = null;
         let currentUpscaleFactor = 2048;
+        let previewObjectUrl = "";
+        const MAX_ENHANCE_UPLOAD_BYTES = 50 * 1024 * 1024;
 
         const dropzone = document.getElementById('dropzone');
         const fileInput = document.getElementById('fileInput');
@@ -542,6 +544,8 @@
 
         async function handleFile(file) {
             if (!file) return;
+            if (!file.type.startsWith('image/')) { alert('请选择图片文件'); return; }
+            if (file.size <= 0 || file.size > MAX_ENHANCE_UPLOAD_BYTES) { alert(`图片大小需不超过 ${MAX_ENHANCE_UPLOAD_BYTES / 1024 / 1024}MB`); return; }
             const btn = document.getElementById('genBtn');
             const btnText = document.getElementById('btnText');
 
@@ -549,30 +553,32 @@
             btn.disabled = true;
             btnText.innerText = tr('studio.uploading');
 
-            const reader = new FileReader();
-            reader.onload = (e) => {
-                previewImg.src = e.target.result;
-                previewImg.classList.remove('hidden');
-                document.getElementById('uploadContent').classList.add('opacity-0');
-                document.getElementById('changeOverlay').classList.replace('hidden', 'flex');
-            };
-            reader.readAsDataURL(file);
+            if (previewObjectUrl) URL.revokeObjectURL(previewObjectUrl);
+            previewObjectUrl = URL.createObjectURL(file);
+            previewImg.src = previewObjectUrl;
+            previewImg.classList.remove('hidden');
+            document.getElementById('uploadContent').classList.add('opacity-0');
+            document.getElementById('changeOverlay').classList.replace('hidden', 'flex');
 
             const formData = new FormData();
             formData.append('files', file);
             try {
                 const res = await fetch('/api/upload', { method: 'POST', body: formData });
+                if (!res.ok) throw new Error((await res.json().catch(() => ({}))).detail || `上传失败（${res.status}）`);
                 const data = await res.json();
+                if (!data.files?.[0]?.comfy_name) throw new Error('上传响应缺少文件信息');
                 uploadedPath = data.files[0].comfy_name;
                 // Enable button after successful upload
                 btn.disabled = false;
                 btnText.innerText = tr('studio.beginRemaster');
             } catch (err) {
-                console.error("Upload error");
-                btnText.innerText = tr('studio.uploadFailed');
+                console.error("Upload error", err);
+                btnText.innerText = err.message || tr('studio.uploadFailed');
                 btn.disabled = false;
             }
         }
+
+        window.addEventListener('beforeunload', () => { if (previewObjectUrl) URL.revokeObjectURL(previewObjectUrl); });
 
         function toggleUpscaleOptions() {
             const toggle = document.getElementById('upscaleToggle');

@@ -1327,8 +1327,12 @@ def load_api_providers():
 def save_api_providers(providers):
     os.makedirs(DATA_DIR, exist_ok=True)
     with GLOBAL_CONFIG_LOCK:
-        with open(API_PROVIDERS_FILE, "w", encoding="utf-8") as f:
+        temp_path = f"{API_PROVIDERS_FILE}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
             json.dump(providers, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, API_PROVIDERS_FILE)
 
 def public_provider(provider):
     if provider.get("id") == "runninghub":
@@ -1452,8 +1456,12 @@ def update_env_values(updates):
         if key not in seen:
             next_lines.append(f"{key}={env_quote(value)}")
             os.environ[key] = str(value or "")
-    with open(API_ENV_FILE, "w", encoding="utf-8") as f:
+    temp_path = f"{API_ENV_FILE}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
         f.write("\n".join(next_lines).rstrip() + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp_path, API_ENV_FILE)
 
 BACKEND_LOCAL_LOAD = {addr: 0 for addr in COMFYUI_INSTANCES}
 
@@ -11680,28 +11688,65 @@ def download_output(request: Request, url: str, name: str = "", inline: bool = F
 @app.post("/api/upload")
 async def upload_image(files: List[UploadFile] = File(...)):
     uploaded_files = []
-    files_content = []
+    max_upload_bytes = int(os.getenv("DETAIL_ENHANCE_MAX_UPLOAD_BYTES", str(LOCAL_IMAGE_IMPORT_MAX_BYTES)))
+    allowed_exts = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+    semaphore = asyncio.Semaphore(max(1, min(4, len(COMFYUI_INSTANCES))))
+
+    def upload_staged(addr: str, staged_path: str, filename: str, content_type: str):
+        try:
+            with open(staged_path, "rb") as stream:
+                response = requests.post(
+                    f"http://{addr}/upload/image",
+                    files={"image": (filename, stream, content_type or "application/octet-stream")},
+                    timeout=float(os.getenv("DETAIL_ENHANCE_UPLOAD_TIMEOUT", "30")),
+                )
+            if response.status_code == 200:
+                return addr, response.json()
+            return addr, None
+        except Exception as exc:
+            print(f"Upload error for {addr}: {exc}")
+            return addr, None
+
     for file in files:
-        content = await file.read()
-        files_content.append((file, content))
+        ext = os.path.splitext(file.filename or "")[1].lower()
+        if ext not in allowed_exts:
+            raise HTTPException(status_code=415, detail=f"{file.filename or '文件'} 不是支持的图片格式")
+        staged_path = ""
+        size = 0
+        try:
+            with tempfile.NamedTemporaryFile(prefix="fy-upload-", suffix=ext, dir=OUTPUT_INPUT_DIR, delete=False) as staged:
+                staged_path = staged.name
+                while True:
+                    chunk = await file.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > max_upload_bytes:
+                        raise HTTPException(status_code=413, detail=f"{file.filename or '文件'} 超过 {max_upload_bytes // (1024 * 1024)}MB，无法上传")
+                    staged.write(chunk)
+            if size <= 0:
+                raise HTTPException(status_code=400, detail="不能上传空文件")
 
-    for file, content in files_content:
-        success_count = 0
-        last_result = None
-        for addr in COMFYUI_INSTANCES:
-            try:
-                files_data = {'image': (file.filename, content, file.content_type)}
-                response = requests.post(f"http://{addr}/upload/image", files=files_data, timeout=5)
-                if response.status_code == 200:
-                    last_result = response.json()
-                    success_count += 1
-            except Exception as e:
-                print(f"Upload error for {addr}: {e}")
+            async def send(addr: str):
+                async with semaphore:
+                    return await asyncio.to_thread(upload_staged, addr, staged_path, os.path.basename(file.filename or "upload"), file.content_type or "image/*")
 
-        if success_count > 0 and last_result:
-            uploaded_files.append({"comfy_name": last_result.get("name", file.filename)})
-        else:
-            raise HTTPException(status_code=500, detail="Failed to upload to any backend")
+            results = await asyncio.gather(*(send(addr) for addr in COMFYUI_INSTANCES))
+            successes = [(addr, result) for addr, result in results if result]
+            if not successes:
+                raise HTTPException(status_code=502, detail="所有 ComfyUI 实例均未完成上传")
+            last_addr, last_result = successes[-1]
+            uploaded_files.append({
+                "comfy_name": last_result.get("name", os.path.basename(file.filename or "upload")),
+                "uploaded_instances": [addr for addr, _ in successes],
+                "size": size,
+            })
+        finally:
+            if staged_path:
+                try:
+                    os.unlink(staged_path)
+                except OSError:
+                    pass
 
     return {"files": uploaded_files}
 

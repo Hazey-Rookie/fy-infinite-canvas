@@ -16,6 +16,10 @@
         p { margin:0 0 24px; color:var(--muted); line-height:1.7; font-size:14px; }
         a { min-height:44px; display:flex; align-items:center; justify-content:center; gap:9px; border-radius:6px; background:var(--primary); color:#fff; text-decoration:none; font-weight:700; }
         a:hover { background:#2863e6; }
+        .tenant-options { display:grid; gap:8px; margin-bottom:14px; }
+        .tenant-options[hidden] { display:none; }
+        .tenant-link { justify-content:flex-start; padding:0 14px; background:#f0f4ff; color:#174ea6; border:1px solid #c8d7ff; }
+        .tenant-link:hover { background:#e4edff; }
         .status { margin-top:18px; padding-top:18px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; line-height:1.6; }
         .status.error { color:#b42318; }
     </style>
@@ -24,7 +28,8 @@
     <main>
         <div class="mark" aria-hidden="true">FY</div>
         <h1>登录扶摇AI Studio</h1>
-        <p>使用企业飞书账号登录。你的菜单和操作权限将根据组织授权自动加载。</p>
+        <p id="intro">使用企业飞书账号登录。你的菜单和操作权限将根据组织授权自动加载。</p>
+        <div id="tenantOptions" class="tenant-options" hidden></div>
         <a id="loginBtn" href="/api/auth/feishu/login?return_to=%2F">使用飞书登录</a>
         <div class="status" id="status">正在检查登录配置...</div>
     </main>
@@ -34,8 +39,19 @@
             .then(config => {
                 const status = document.getElementById('status');
                 const loginButton = document.getElementById('loginBtn');
+                const tenantOptions = document.getElementById('tenantOptions');
+                const intro = document.getElementById('intro');
                 if(config.sso_configured) {
-                    status.textContent = config.bitable_enabled ? '企业登录与权限数据源已连接' : '企业登录已连接，权限表尚未完成配置';
+                    status.textContent = '企业登录已连接，权限数据由本地安全存储维护';
+                    const match = location.pathname.match(/^\/t\/([^/]+)/);
+                    if(match) loginButton.href = `/api/auth/feishu/login?tenant=${encodeURIComponent(match[1])}&return_to=%2F`;
+                    const tenants = Array.isArray(config.tenants) ? config.tenants.filter(item => item && item.enabled && item.slug && item.name) : [];
+                    if(!match && tenants.length > 1) {
+                        intro.textContent = '请选择要登录的企业，系统将使用该企业自己的飞书应用完成认证。';
+                        tenantOptions.innerHTML = tenants.map(item => `<a class="tenant-link" href="/api/auth/feishu/login?tenant=${encodeURIComponent(item.slug)}&return_to=%2F">${String(item.name).replace(/[&<>'"]/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]))}</a>`).join('');
+                        tenantOptions.hidden = false;
+                        loginButton.hidden = true;
+                    }
                     return;
                 }
                 status.classList.add('error');

@@ -5,7 +5,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>组织与权限</title>
     <link rel="stylesheet" href="/static/vendor/css/fonts.css?v=2026.07.23.1784827838">
-    <link rel="stylesheet" href="/static/css/org-permissions.css?v=2026.07.23.1784828112">
+    <link rel="stylesheet" href="/static/css/org-permissions.css?v=2026.07.23.1784933275">
+    <style>.editor-actions{display:flex;align-items:center;gap:8px}</style>
 </head>
 <body>
     <div class="page-shell">
@@ -19,6 +20,25 @@
             </button>
         </header>
         <div id="notice" class="notice" hidden></div>
+        <section id="tenantManagement" class="tenant-management" hidden>
+            <aside class="tenant-list-pane">
+                <div class="tenant-list-heading"><strong>企业列表</strong><button id="newTenantBtn" class="icon-command small" type="button" title="生成企业接入邀请" aria-label="生成企业接入邀请"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"></path></svg></button></div>
+                <div id="tenantList" class="tenant-list"></div>
+            </aside>
+            <div class="tenant-detail">
+                <div><strong id="selectedTenantName">当前企业</strong><span id="selectedTenantMeta"></span><div id="tenantLoginAddress" class="tenant-login-address" hidden><small>企业登录地址</small><div><code id="tenantLoginUrl"></code><button id="copyTenantLoginBtn" class="icon-command tiny" type="button" title="复制企业登录地址" aria-label="复制企业登录地址"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="11" height="11" rx="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg></button></div></div></div>
+                <div class="tenant-actions"><button id="syncTenantBtn" class="secondary-command" type="button">同步成员</button><button id="deleteTenantBtn" class="danger-command" type="button">解除企业</button></div>
+            </div>
+        </section>
+        <dialog id="inviteDialog" class="invite-dialog">
+            <form method="dialog" class="invite-dialog-content">
+                <div class="invite-dialog-heading"><strong>生成企业接入邀请</strong><button class="icon-command small" value="cancel" type="submit" aria-label="关闭">×</button></div>
+                <label>企业备注<input id="inviteTenantName" type="text" maxlength="80" placeholder="用于识别邀请，可留空"></label>
+                <label>有效期<select id="inviteExpires"><option value="30">30 分钟</option><option value="60" selected>1 小时</option><option value="240">4 小时</option><option value="1440">24 小时</option></select></label>
+                <button id="generateInviteBtn" class="primary-command" type="button">生成一次性链接</button>
+                <div id="inviteResult" class="invite-result" hidden><input id="inviteUrl" type="text" readonly><button id="copyInviteBtn" class="secondary-command" type="button">复制链接</button><span id="inviteExpiry"></span></div>
+            </form>
+        </dialog>
         <nav class="tabs" aria-label="权限视图">
             <button class="tab active" type="button" data-tab="members">成员授权</button>
             <button class="tab" type="button" data-tab="roles">角色菜单</button>
@@ -30,10 +50,13 @@
                         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
                         <input id="memberSearch" type="search" placeholder="搜索姓名、邮箱或部门">
                     </label>
-                    <div id="memberSummary" class="summary"></div>
+                    <div class="toolbar-meta">
+                        <div id="memberSummary" class="summary"></div>
+                        <div class="member-help"><span><strong>默认成员</strong> 使用默认 member 权限</span><span><strong>已授权</strong> 有单独角色覆盖</span><span><strong>恢复默认</strong> 删除覆盖，不删除通讯录成员</span></div>
+                    </div>
                 </div>
                 <div class="table-wrap">
-                    <table><thead><tr><th>成员</th><th>部门</th><th>角色</th><th>状态</th><th>操作</th></tr></thead><tbody id="memberRows"></tbody></table>
+                    <table><thead><tr><th>成员</th><th>部门</th><th>角色</th><th>企业管理员</th><th>状态</th><th>操作</th></tr></thead><tbody id="memberRows"></tbody></table>
                     <div id="memberEmpty" class="empty" hidden>暂无可见成员</div>
                 </div>
             </section>
@@ -46,8 +69,9 @@
                     <section class="role-editor">
                         <div class="editor-heading">
                             <div><input id="roleName" class="role-name-input" type="text" placeholder="role_key" maxlength="40"><input id="roleDisplayName" class="role-display-input" type="text" placeholder="角色名称" maxlength="40"></div>
-                            <button id="saveRoleBtn" class="primary-command" type="button">保存角色</button>
+                            <div class="editor-actions"><button id="deleteRoleBtn" class="icon-command small" type="button" title="删除角色" aria-label="删除角色"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M3 6h18"></path><path d="M8 6V4h8v2"></path><path d="M19 6l-1 14H6L5 6"></path></svg></button><button id="saveRoleBtn" class="primary-command" type="button">保存角色</button></div>
                         </div>
+                        <div id="roleScopeNote" class="role-scope-note" hidden></div>
                         <div id="permissionGroups" class="permission-groups"></div>
                     </section>
                 </div>
@@ -55,6 +79,6 @@
         </main>
     </div>
     <div id="toast" class="toast" role="status" hidden></div>
-    <script src="/static/js/org-permissions.js?v=2026.07.23.1784828112"></script>
+    <script src="/static/js/org-permissions.js?v=2026.07.23.1784936284"></script>
 </body>
 </html>

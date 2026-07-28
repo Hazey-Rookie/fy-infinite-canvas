@@ -4,10 +4,14 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
+import sqlite3
+import threading
+import tempfile
 import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 import httpx
@@ -20,6 +24,42 @@ FEISHU_AUTHORIZE_URL = "https://accounts.feishu.cn/open-apis/authen/v1/authorize
 SESSION_COOKIE = "fy_session"
 OAUTH_STATE_COOKIE = "fy_oauth_state"
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def _auth_env_file() -> str:
+    return os.getenv("FY_AUTH_CONFIG_FILE", "").strip() or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "API", ".env"
+    )
+
+
+def _persist_tenant_configs(tenants: Dict[str, Dict[str, Any]]) -> None:
+    """Persist tenant SSO config in the private runtime env file atomically."""
+    path = _auth_env_file()
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    existing: List[str] = []
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8-sig") as handle:
+            existing = handle.read().splitlines()
+    value = json.dumps(list(tenants.values()), ensure_ascii=False, separators=(",", ":"))
+    output: List[str] = []
+    replaced = False
+    for line in existing:
+        if line.strip().startswith("FY_TENANTS_JSON="):
+            output.append(f"FY_TENANTS_JSON={value}")
+            replaced = True
+        else:
+            output.append(line)
+    if not replaced:
+        if output and output[-1].strip():
+            output.append("")
+        output.append(f"FY_TENANTS_JSON={value}")
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write("\n".join(output).rstrip("\n") + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp_path, path)
 
 CORE_MENU_PERMISSIONS = [
     "menu:text-to-image",
@@ -61,6 +101,15 @@ DEFAULT_ROLES: Dict[str, Dict[str, Any]] = {
         "permissions": CORE_MENU_PERMISSIONS + ["action:read"],
         "system": True,
     },
+}
+
+ROLE_PERMISSION_ALLOWLIST = set(DEFAULT_ROLES["admin"]["permissions"])
+PLATFORM_ONLY_PERMISSIONS = {
+    "menu:api-settings",
+    "menu:more-settings",
+    "menu:workflow-settings",
+    "settings:api:manage",
+    "settings:more:manage",
 }
 
 
@@ -143,11 +192,10 @@ class AuthSettings:
     redirect_uris: List[str]
     session_secret: str
     super_admin_ids: List[str]
-    bitable_app_token: str
-    members_table_id: str
-    roles_table_id: str
     cookie_secure: bool
     default_role: str
+    tenants: Optional[Dict[str, Dict[str, Any]]] = None
+    db_path: str = ""
 
     @classmethod
     def from_env(cls) -> "AuthSettings":
@@ -161,6 +209,40 @@ class AuthSettings:
         redirect_uri = os.getenv("FEISHU_REDIRECT_URI", "").strip()
         redirect_uris = _csv_env("FEISHU_REDIRECT_URIS")
         redirect_uris = list(dict.fromkeys([item for item in [redirect_uri, *redirect_uris] if item]))
+        tenants: Dict[str, Dict[str, Any]] = {}
+        raw_tenants = os.getenv("FY_TENANTS_JSON", "").strip()
+        if raw_tenants:
+            try:
+                parsed = json.loads(raw_tenants)
+                values = parsed.values() if isinstance(parsed, dict) else parsed
+                for item in values:
+                    if not isinstance(item, dict):
+                        continue
+                    key = _field_text(item.get("tenant_key") or item.get("key") or item.get("slug")).lower()
+                    if key:
+                        tenants[key] = {
+                            "tenant_key": key,
+                            "slug": _field_text(item.get("slug") or key).lower(),
+                            "name": _field_text(item.get("name") or key),
+                            "app_id": _field_text(item.get("app_id")),
+                            "app_secret": _field_text(item.get("app_secret")),
+                            "redirect_uris": list(dict.fromkeys(item.get("redirect_uris") or redirect_uris)),
+                            "enabled": bool(item.get("enabled", True)),
+                        }
+            except (TypeError, ValueError, json.JSONDecodeError):
+                tenants = {}
+        default_tenant_key = os.getenv("FY_DEFAULT_TENANT_KEY", "default").strip().lower() or "default"
+        default_tenant_name = os.getenv("FY_DEFAULT_TENANT_NAME", "默认企业").strip() or "默认企业"
+        if not tenants:
+            tenants[default_tenant_key] = {
+                "tenant_key": default_tenant_key,
+                "slug": default_tenant_key,
+                "name": default_tenant_name,
+                "app_id": app_id,
+                "app_secret": app_secret,
+                "redirect_uris": redirect_uris,
+                "enabled": True,
+            }
         return cls(
             app_id=app_id,
             app_secret=app_secret,
@@ -168,11 +250,10 @@ class AuthSettings:
             redirect_uris=redirect_uris,
             session_secret=session_secret,
             super_admin_ids=_csv_env("FY_SUPER_ADMIN_IDS"),
-            bitable_app_token=os.getenv("FEISHU_BITABLE_APP_TOKEN", "").strip(),
-            members_table_id=os.getenv("FEISHU_BITABLE_MEMBERS_TABLE_ID", "").strip(),
-            roles_table_id=os.getenv("FEISHU_BITABLE_ROLES_TABLE_ID", "").strip(),
             cookie_secure=_bool_env("FY_COOKIE_SECURE", False),
             default_role="member",
+            tenants=tenants,
+            db_path=os.getenv("FY_AUTH_DB_PATH", "").strip() or os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "fy_auth.db"),
         )
 
     @property
@@ -181,11 +262,41 @@ class AuthSettings:
 
     @property
     def sso_configured(self) -> bool:
-        return bool(self.app_id and self.app_secret and self.allowed_redirect_uris and self.super_admin_ids)
+        if self.tenants is None:
+            return bool(self.app_id and self.app_secret and self.allowed_redirect_uris and self.super_admin_ids)
+        return any(
+            item.get("app_id") and item.get("app_secret") and item.get("redirect_uris")
+            for item in (self.tenants or {}).values()
+        )
 
     @property
-    def bitable_configured(self) -> bool:
-        return bool(self.bitable_app_token and self.members_table_id and self.roles_table_id)
+    def default_tenant_key(self) -> str:
+        return next(iter(self.tenants or {}), "default")
+
+    def tenant_config(self, tenant_key: str = "") -> Dict[str, Any]:
+        key = _field_text(tenant_key).lower() or self.default_tenant_key
+        if self.tenants is None or not self.tenants:
+            return {
+                "tenant_key": key, "slug": key, "name": "默认企业" if key == self.default_tenant_key else "当前企业",
+                "app_id": self.app_id, "app_secret": self.app_secret,
+                "redirect_uris": self.allowed_redirect_uris, "enabled": True,
+            }
+        return dict((self.tenants or {}).get(key) or {})
+
+    def settings_for_tenant(self, tenant_key: str = "") -> "AuthSettings":
+        config = self.tenant_config(tenant_key)
+        return AuthSettings(
+            app_id=_field_text(config.get("app_id") or self.app_id),
+            app_secret=_field_text(config.get("app_secret") or self.app_secret),
+            redirect_uri=_field_text((config.get("redirect_uris") or self.allowed_redirect_uris)[0] if (config.get("redirect_uris") or self.allowed_redirect_uris) else ""),
+            redirect_uris=list(config.get("redirect_uris") or self.allowed_redirect_uris),
+            session_secret=self.session_secret,
+            super_admin_ids=self.super_admin_ids,
+            cookie_secure=self.cookie_secure,
+            default_role=self.default_role,
+            tenants=self.tenants,
+            db_path=self.db_path,
+        )
 
     def missing_sso_fields(self) -> List[str]:
         values = {
@@ -195,15 +306,6 @@ class AuthSettings:
             "FY_SUPER_ADMIN_IDS": self.super_admin_ids,
         }
         return [key for key, value in values.items() if not value]
-
-    def missing_bitable_fields(self) -> List[str]:
-        values = {
-            "FEISHU_BITABLE_APP_TOKEN": self.bitable_app_token,
-            "FEISHU_BITABLE_MEMBERS_TABLE_ID": self.members_table_id,
-            "FEISHU_BITABLE_ROLES_TABLE_ID": self.roles_table_id,
-        }
-        return [key for key, value in values.items() if not value]
-
 
 class SignedTokenCodec:
     def __init__(self, secret: str):
@@ -242,8 +344,19 @@ class FeishuClient:
         try:
             async with httpx.AsyncClient(timeout=20.0) as client:
                 response = await client.request(method, url, **kwargs)
-                response.raise_for_status()
-                payload = response.json()
+                try:
+                    payload = response.json()
+                except ValueError:
+                    payload = {}
+                if response.is_error:
+                    code = payload.get("code") if isinstance(payload, dict) else None
+                    message = payload.get("msg") or payload.get("message") if isinstance(payload, dict) else ""
+                    detail = message or f"HTTP {response.status_code}"
+                    if code not in (None, ""):
+                        detail = f"{detail}（code={code}）"
+                    raise FeishuAPIError(f"飞书接口请求失败：{detail}")
+        except FeishuAPIError:
+            raise
         except (httpx.HTTPError, ValueError) as exc:
             raise FeishuAPIError(f"飞书接口请求失败：{exc}") from exc
         code = payload.get("code", 0) if isinstance(payload, dict) else -1
@@ -379,6 +492,26 @@ class FeishuClient:
             {"fetch_child": "true", "page_size": 50, "department_id_type": "open_department_id"},
         )
 
+    async def get_root_department(self) -> Dict[str, Any]:
+        payload = await self._request(
+            "GET",
+            f"{FEISHU_OPEN_API}/contact/v3/departments/0",
+            params={"department_id_type": "open_department_id", "user_id_type": "open_id"},
+            headers=await self.tenant_headers(),
+        )
+        return dict((payload.get("data") or {}).get("department") or {})
+
+    async def get_tenant_info(self) -> Dict[str, Any]:
+        """Read the enterprise profile exposed by the tenant information API."""
+        payload = await self._request(
+            "GET",
+            f"{FEISHU_OPEN_API}/tenant/v2/tenant",
+            headers=await self.tenant_headers(),
+        )
+        data = payload.get("data") or {}
+        tenant = data.get("tenant") if isinstance(data, dict) else data
+        return dict(tenant or {}) if isinstance(tenant, dict) else {}
+
     async def list_users_for_department(self, department_id: str) -> List[Dict[str, Any]]:
         return await self.paged_get(
             "/contact/v3/users/find_by_department",
@@ -391,192 +524,603 @@ class FeishuClient:
         )
 
 
-class BitablePermissionStore:
-    MEMBER_FIELDS = {
-        "open_id": "Open ID",
-        "user_id": "User ID",
-        "name": "Name",
-        "email": "Email",
-        "department_ids": "Department IDs",
-        "role": "Role",
-        "status": "Status",
-        "updated_at": "Updated At",
-    }
-    ROLE_FIELDS = {
-        "name": "Role",
-        "display_name": "Display Name",
-        "permissions": "Permissions",
-        "system": "System",
-        "updated_at": "Updated At",
-    }
+class SQLitePermissionStore:
+    """Application-owned tenant-scoped authorization storage.
 
-    def __init__(self, settings: AuthSettings, client: FeishuClient):
+    Feishu remains the identity and directory source; this store owns roles,
+    local overrides and tenant-admin assignments. Writes are transactional and
+    use SQLite WAL so multiple workers do not silently overwrite each other.
+    """
+
+    def __init__(self, settings: AuthSettings, client: Optional[FeishuClient] = None):
         self.settings = settings
         self.client = client
+        default_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "fy_auth.db")
+        self.db_path = settings.db_path or os.getenv("FY_AUTH_DB_PATH", "") or default_path
+        if not settings.db_path and not os.getenv("FY_AUTH_DB_PATH") and settings.tenants is None:
+            self.db_path = os.path.join(tempfile.gettempdir(), f"fy-auth-{secrets.token_hex(8)}.db")
+        self._memory_anchor: Optional[sqlite3.Connection] = None
+        if self.db_path == ":memory:":
+            self.db_path = f"file:fy-auth-{secrets.token_hex(8)}?mode=memory&cache=shared"
+            self._memory_anchor = sqlite3.connect(self.db_path, uri=True, check_same_thread=False)
+        self._lock = threading.RLock()
         self._cache: Dict[str, Any] = {}
         self._cache_expires_at = 0.0
+        self._initialize()
 
-    @property
-    def configured(self) -> bool:
-        return self.settings.bitable_configured
+    def _connect(self) -> sqlite3.Connection:
+        is_memory_uri = self.db_path.startswith("file:")
+        if not is_memory_uri:
+            os.makedirs(os.path.dirname(os.path.abspath(self.db_path)), exist_ok=True)
+        connection = sqlite3.connect(self.db_path, timeout=10, check_same_thread=False, uri=is_memory_uri)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        if not is_memory_uri:
+            connection.execute("PRAGMA journal_mode = WAL")
+        return connection
 
-    async def _list_records(self, table_id: str) -> List[Dict[str, Any]]:
-        return await self.client.paged_get(
-            f"/bitable/v1/apps/{self.settings.bitable_app_token}/tables/{table_id}/records",
-            {"page_size": 100},
+    def _initialize(self) -> None:
+        with self._lock, self._connect() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS schema_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS tenants (
+                    tenant_id TEXT PRIMARY KEY,
+                    tenant_key TEXT NOT NULL UNIQUE,
+                    display_name TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    updated_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS roles (
+                    tenant_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    display_name TEXT NOT NULL,
+                    permissions TEXT NOT NULL,
+                    system INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (tenant_id, name),
+                    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS members (
+                    tenant_id TEXT NOT NULL,
+                    identity_key TEXT NOT NULL,
+                    open_id TEXT NOT NULL DEFAULT '',
+                    user_id TEXT NOT NULL DEFAULT '',
+                    union_id TEXT NOT NULL DEFAULT '',
+                    name TEXT NOT NULL DEFAULT '',
+                    email TEXT NOT NULL DEFAULT '',
+                    mobile TEXT NOT NULL DEFAULT '',
+                    department_ids TEXT NOT NULL DEFAULT '[]',
+                    role_override TEXT,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    directory_state TEXT NOT NULL DEFAULT 'active',
+                    is_tenant_admin INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (tenant_id, identity_key),
+                    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS tenant_invitations (
+                    token_hash TEXT PRIMARY KEY,
+                    tenant_name TEXT NOT NULL DEFAULT '',
+                    expires_at INTEGER NOT NULL,
+                    used_at INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_members_lookup ON members(tenant_id, open_id, user_id, email, mobile);
+                INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('version', '1');
+                UPDATE schema_meta SET value = '2' WHERE key = 'version';
+                """
+            )
+            for tenant_key, config in (self.settings.tenants or {}).items():
+                self._ensure_tenant(connection, tenant_key, config.get("name") or tenant_key)
+            connection.commit()
+
+    @staticmethod
+    def _now() -> int:
+        return int(time.time() * 1000)
+
+    def _ensure_tenant(self, connection: sqlite3.Connection, tenant_key: str, display_name: str = "") -> str:
+        key = _field_text(tenant_key).lower() or "default"
+        row = connection.execute("SELECT tenant_id, display_name FROM tenants WHERE tenant_key = ?", (key,)).fetchone()
+        if row:
+            configured_name = _field_text(display_name)
+            if configured_name and (_field_text(row[1]) in {"", _field_text(row[0])}):
+                connection.execute("UPDATE tenants SET display_name = ?, updated_at = ? WHERE tenant_id = ?", (configured_name, self._now(), row[0]))
+            return str(row[0])
+        tenant_id = secrets.token_hex(16)
+        connection.execute(
+            "INSERT INTO tenants(tenant_id, tenant_key, display_name, enabled, updated_at) VALUES (?, ?, ?, 1, ?)",
+            (tenant_id, key, _field_text(display_name) or key, self._now()),
         )
+        for name, role in DEFAULT_ROLES.items():
+            connection.execute(
+                "INSERT OR IGNORE INTO roles(tenant_id, name, display_name, permissions, system, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (tenant_id, name, role["display_name"], json.dumps(role["permissions"], ensure_ascii=False), int(role.get("system")), self._now()),
+            )
+        return tenant_id
 
-    def _member_from_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        fields = record.get("fields") or {}
-        return {
-            "record_id": record.get("record_id") or "",
-            "open_id": _field_text(fields.get(self.MEMBER_FIELDS["open_id"])),
-            "user_id": _field_text(fields.get(self.MEMBER_FIELDS["user_id"])),
-            "name": _field_text(fields.get(self.MEMBER_FIELDS["name"])),
-            "email": _field_text(fields.get(self.MEMBER_FIELDS["email"])),
-            "department_ids": _json_list(fields.get(self.MEMBER_FIELDS["department_ids"])),
-            "role": _field_text(fields.get(self.MEMBER_FIELDS["role"])).lower(),
-            "status": _field_text(fields.get(self.MEMBER_FIELDS["status"])).lower() or "active",
-        }
+    def tenant_id(self, tenant_key: str = "") -> str:
+        key = _field_text(tenant_key).lower() or self.settings.default_tenant_key
+        with self._lock, self._connect() as connection:
+            tenant_id = self._ensure_tenant(connection, key, (self.settings.tenant_config(key) or {}).get("name") or key)
+            connection.commit()
+            return tenant_id
 
-    def _role_from_record(self, record: Dict[str, Any]) -> Dict[str, Any]:
-        fields = record.get("fields") or {}
-        name = _field_text(fields.get(self.ROLE_FIELDS["name"])).lower()
-        return {
-            "record_id": record.get("record_id") or "",
-            "name": name,
-            "display_name": _field_text(fields.get(self.ROLE_FIELDS["display_name"])) or name,
-            "permissions": _json_list(fields.get(self.ROLE_FIELDS["permissions"])),
-            "system": _field_text(fields.get(self.ROLE_FIELDS["system"])).lower() in {"1", "true", "yes"},
-        }
-
-    async def snapshot(self, refresh: bool = False) -> Dict[str, Any]:
-        if not self.configured:
-            return {"members": [], "roles": dict(DEFAULT_ROLES), "source": "defaults"}
-        if not refresh and self._cache and time.time() < self._cache_expires_at:
-            return self._cache
-        member_records, role_records = await self._list_records(self.settings.members_table_id), await self._list_records(self.settings.roles_table_id)
-        members = [self._member_from_record(record) for record in member_records]
-        roles = {name: dict(role) for name, role in DEFAULT_ROLES.items()}
-        for record in role_records:
-            role = self._role_from_record(record)
-            if role["name"]:
-                roles[role["name"]] = role
-        self._cache = {"members": members, "roles": roles, "source": "bitable"}
-        self._cache_expires_at = time.time() + 30
-        return self._cache
-
-    async def member_for(self, user: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        snapshot = await self.snapshot()
-        candidates = {str(user.get(key) or "").strip() for key in ("open_id", "user_id", "email", "mobile")}
-        candidates.discard("")
-        for member in snapshot["members"]:
-            identifiers = {str(member.get(key) or "").strip() for key in ("open_id", "user_id", "email")}
-            if candidates.intersection(identifiers):
-                return member
-        return None
-
-    async def role_map(self) -> Dict[str, Dict[str, Any]]:
-        return (await self.snapshot())["roles"]
-
-    async def _write_record(self, table_id: str, fields: Dict[str, Any], record_id: str = "") -> Dict[str, Any]:
-        base = f"{FEISHU_OPEN_API}/bitable/v1/apps/{self.settings.bitable_app_token}/tables/{table_id}/records"
-        method = "PUT" if record_id else "POST"
-        url = f"{base}/{record_id}" if record_id else base
-        payload = await self.client._request(method, url, json={"fields": fields}, headers=await self.client.tenant_headers())
-        self._cache_expires_at = 0
-        return (payload.get("data") or {}).get("record") or payload.get("data") or {}
-
-    async def save_member(self, member: Dict[str, Any]) -> Dict[str, Any]:
-        if not self.configured:
-            raise FeishuAPIError("未配置飞书多维表格")
-        existing = await self.member_for(member)
-        fields = {
-            self.MEMBER_FIELDS["open_id"]: _field_text(member.get("open_id")),
-            self.MEMBER_FIELDS["user_id"]: _field_text(member.get("user_id")),
-            self.MEMBER_FIELDS["name"]: _field_text(member.get("name")),
-            self.MEMBER_FIELDS["email"]: _field_text(member.get("email")),
-            self.MEMBER_FIELDS["department_ids"]: json.dumps(member.get("department_ids") or [], ensure_ascii=False),
-            self.MEMBER_FIELDS["role"]: _field_text(member.get("role")) or self.settings.default_role,
-            self.MEMBER_FIELDS["status"]: _field_text(member.get("status")) or "active",
-            self.MEMBER_FIELDS["updated_at"]: int(time.time() * 1000),
-        }
-        return await self._write_record(
-            self.settings.members_table_id,
-            fields,
-            (existing or {}).get("record_id") or _field_text(member.get("record_id")),
-        )
-
-    async def delete_member(self, member: Dict[str, Any]) -> bool:
-        if not self.configured:
-            raise FeishuAPIError("未配置飞书多维表格")
-        existing = await self.member_for(member)
-        record_id = _field_text((existing or {}).get("record_id"))
-        if not record_id:
+    def tenant_enabled(self, tenant_key: str = "") -> bool:
+        key = _field_text(tenant_key).lower() or self.settings.default_tenant_key
+        configured = self.settings.tenant_config(key)
+        if configured and not bool(configured.get("enabled", True)):
             return False
-        url = (
-            f"{FEISHU_OPEN_API}/bitable/v1/apps/{self.settings.bitable_app_token}"
-            f"/tables/{self.settings.members_table_id}/records/{record_id}"
-        )
-        await self.client._request("DELETE", url, headers=await self.client.tenant_headers())
+        with self._lock, self._connect() as connection:
+            row = connection.execute("SELECT enabled FROM tenants WHERE tenant_key = ?", (key,)).fetchone()
+            return bool(row[0]) if row else bool((self.settings.tenant_config(key) or {}).get("enabled", False))
+
+    def list_tenants(self) -> List[Dict[str, Any]]:
+        with self._lock, self._connect() as connection:
+            rows = connection.execute("SELECT tenant_id, tenant_key, display_name, enabled, updated_at FROM tenants ORDER BY tenant_key").fetchall()
+        return [{"tenant_id": row["tenant_id"], "tenant_key": row["tenant_key"], "name": row["display_name"], "enabled": bool(row["enabled"]), "updated_at": row["updated_at"]} for row in rows]
+
+    def set_tenant_enabled(self, tenant_key: str, enabled: bool, display_name: str = "") -> Dict[str, Any]:
+        key = _field_text(tenant_key).lower()
+        if not key:
+            raise FeishuAPIError("租户标识不能为空")
+        with self._lock, self._connect() as connection:
+            tenant_id = self._ensure_tenant(connection, key, display_name or key)
+            connection.execute("UPDATE tenants SET display_name = COALESCE(NULLIF(?, ''), display_name), enabled = ?, updated_at = ? WHERE tenant_id = ?", (_field_text(display_name), int(bool(enabled)), self._now(), tenant_id))
+            connection.commit()
+            row = connection.execute("SELECT tenant_id, tenant_key, display_name, enabled, updated_at FROM tenants WHERE tenant_id = ?", (tenant_id,)).fetchone()
+        return {"tenant_id": row["tenant_id"], "tenant_key": row["tenant_key"], "name": row["display_name"], "enabled": bool(row["enabled"]), "updated_at": row["updated_at"]}
+
+    def delete_tenant(self, tenant_key: str) -> bool:
+        key = _field_text(tenant_key).lower()
+        if not key:
+            raise FeishuAPIError("租户标识不能为空")
+        with self._lock, self._connect() as connection:
+            count = connection.execute("SELECT COUNT(*) FROM tenants").fetchone()[0]
+            if count <= 1:
+                raise FeishuAPIError("至少保留一个企业，不能解除最后一个企业")
+            row = connection.execute("SELECT tenant_id FROM tenants WHERE tenant_key = ?", (key,)).fetchone()
+            if not row:
+                return False
+            connection.execute("DELETE FROM tenants WHERE tenant_id = ?", (row[0],))
+            connection.commit()
+        self._cache.pop(key, None)
         self._cache_expires_at = 0
         return True
 
-    async def save_role(self, role: Dict[str, Any]) -> Dict[str, Any]:
-        if not self.configured:
-            raise FeishuAPIError("未配置飞书多维表格")
-        roles = await self.role_map()
-        existing = roles.get(_field_text(role.get("name")).lower()) or {}
-        fields = {
-            self.ROLE_FIELDS["name"]: _field_text(role.get("name")).lower(),
-            self.ROLE_FIELDS["display_name"]: _field_text(role.get("display_name")),
-            self.ROLE_FIELDS["permissions"]: json.dumps(role.get("permissions") or [], ensure_ascii=False),
-            self.ROLE_FIELDS["system"]: bool(role.get("system")),
-            self.ROLE_FIELDS["updated_at"]: int(time.time() * 1000),
+    @staticmethod
+    def _invitation_hash(token: str) -> str:
+        return hashlib.sha256(_field_text(token).encode("utf-8")).hexdigest()
+
+    def create_tenant_invitation(self, tenant_name: str = "", ttl_seconds: int = 3600) -> Dict[str, Any]:
+        ttl = max(300, min(int(ttl_seconds), 24 * 60 * 60))
+        token = secrets.token_urlsafe(32)
+        now = self._now()
+        expires_at = now + ttl * 1000
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                "INSERT INTO tenant_invitations(token_hash, tenant_name, expires_at, used_at, created_at) VALUES (?, ?, ?, 0, ?)",
+                (self._invitation_hash(token), _field_text(tenant_name), expires_at, now),
+            )
+            connection.commit()
+        return {"token": token, "tenant_name": _field_text(tenant_name), "expires_at": expires_at}
+
+    def tenant_invitation(self, token: str) -> Optional[Dict[str, Any]]:
+        token_hash = self._invitation_hash(token)
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT tenant_name, expires_at, used_at, created_at FROM tenant_invitations WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+        if not row:
+            return None
+        now = self._now()
+        return {
+            "tenant_name": row["tenant_name"], "expires_at": row["expires_at"],
+            "used": row["used_at"] != 0, "expired": row["expires_at"] <= now,
+            "created_at": row["created_at"],
         }
-        return await self._write_record(self.settings.roles_table_id, fields, existing.get("record_id") or "")
+
+    def claim_tenant_invitation(self, token: str) -> bool:
+        token_hash = self._invitation_hash(token)
+        now = self._now()
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE tenant_invitations SET used_at = ? WHERE token_hash = ? AND used_at = 0 AND expires_at > ?",
+                (-now, token_hash, now),
+            )
+            connection.commit()
+        return cursor.rowcount == 1
+
+    def finish_tenant_invitation(self, token: str, success: bool) -> None:
+        token_hash = self._invitation_hash(token)
+        with self._lock, self._connect() as connection:
+            if success:
+                connection.execute(
+                    "UPDATE tenant_invitations SET used_at = ? WHERE token_hash = ? AND used_at < 0",
+                    (self._now(), token_hash),
+                )
+            else:
+                connection.execute(
+                    "UPDATE tenant_invitations SET used_at = 0 WHERE token_hash = ? AND used_at < 0",
+                    (token_hash,),
+                )
+            connection.commit()
+
+    def _identity_key(self, user: Dict[str, Any]) -> str:
+        return _field_text(user.get("open_id") or user.get("user_id") or user.get("union_id") or user.get("email") or user.get("mobile"))
+
+    def _row_member(self, row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "open_id": row["open_id"], "user_id": row["user_id"], "union_id": row["union_id"],
+            "name": row["name"], "email": row["email"], "mobile": row["mobile"],
+            "department_ids": _json_list(row["department_ids"]),
+            "role": row["role_override"] or "", "status": row["status"],
+            "directory_state": row["directory_state"],
+            "is_tenant_admin": bool(row["is_tenant_admin"]),
+            "updated_at": row["updated_at"], "managed": bool(row["role_override"] or row["is_tenant_admin"] or row["status"] != "active"),
+        }
+
+    async def snapshot(self, tenant_key: str = "", refresh: bool = False) -> Dict[str, Any]:
+        key = _field_text(tenant_key).lower() or self.settings.default_tenant_key
+        if not refresh and self._cache.get(key) and time.time() < self._cache_expires_at:
+            return self._cache[key]
+        tenant_id = self.tenant_id(key)
+        with self._lock, self._connect() as connection:
+            role_rows = connection.execute("SELECT * FROM roles WHERE tenant_id = ? ORDER BY name", (tenant_id,)).fetchall()
+            member_rows = connection.execute("SELECT * FROM members WHERE tenant_id = ? ORDER BY name", (tenant_id,)).fetchall()
+        roles = {name: dict(role) for name, role in DEFAULT_ROLES.items()}
+        for row in role_rows:
+            roles[row["name"]] = {
+                "name": row["name"], "display_name": row["display_name"],
+                "permissions": _json_list(row["permissions"]), "system": bool(row["system"]),
+                "updated_at": row["updated_at"],
+            }
+        result = {"members": [self._row_member(row) for row in member_rows], "roles": roles, "source": "local", "tenant_key": key}
+        self._cache[key] = result
+        self._cache_expires_at = time.time() + 15
+        return result
+
+    async def member_for(self, user: Dict[str, Any], tenant_key: str = "") -> Optional[Dict[str, Any]]:
+        candidates = {_field_text(user.get(key)) for key in ("open_id", "user_id", "union_id", "email", "mobile")}
+        candidates.discard("")
+        if not candidates:
+            return None
+        snapshot = await self.snapshot(tenant_key)
+        for member in snapshot["members"]:
+            if candidates.intersection(_identity_values(member)):
+                return member
+        return None
+
+    async def upsert_directory_user(self, user: Dict[str, Any], tenant_key: str = "", directory_state: str = "active") -> Dict[str, Any]:
+        identity = self._identity_key(user)
+        if not identity:
+            return {}
+        tenant_id = self.tenant_id(tenant_key)
+        with self._lock, self._connect() as connection:
+            existing = connection.execute("SELECT role_override, status, is_tenant_admin FROM members WHERE tenant_id = ? AND identity_key = ?", (tenant_id, identity)).fetchone()
+            connection.execute(
+                """INSERT INTO members(tenant_id, identity_key, open_id, user_id, union_id, name, email, mobile, department_ids, role_override, status, directory_state, is_tenant_admin, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(tenant_id, identity_key) DO UPDATE SET open_id=excluded.open_id, user_id=excluded.user_id, union_id=excluded.union_id, name=excluded.name, email=excluded.email, mobile=excluded.mobile, department_ids=excluded.department_ids, directory_state=excluded.directory_state, updated_at=excluded.updated_at""",
+                (tenant_id, identity, _field_text(user.get("open_id")), _field_text(user.get("user_id")), _field_text(user.get("union_id")), _field_text(user.get("name")), _field_text(user.get("email")), _field_text(user.get("mobile")), json.dumps(user.get("department_ids") or [], ensure_ascii=False), (existing[0] if existing else None), (existing[1] if existing else "active"), directory_state, int(existing[2]) if existing else 0, self._now()),
+            )
+            connection.commit()
+        self._cache_expires_at = 0
+        return (await self.member_for(user, tenant_key)) or {}
+
+    async def sync_directory(self, users: List[Dict[str, Any]], tenant_key: str = "") -> None:
+        tenant_id = self.tenant_id(tenant_key)
+        seen = set()
+        with self._lock, self._connect() as connection:
+            for user in users:
+                identity = self._identity_key(user)
+                if not identity:
+                    continue
+                seen.add(identity)
+                existing = connection.execute("SELECT role_override, status, is_tenant_admin FROM members WHERE tenant_id = ? AND identity_key = ?", (tenant_id, identity)).fetchone()
+                connection.execute(
+                    """INSERT INTO members(tenant_id, identity_key, open_id, user_id, union_id, name, email, mobile, department_ids, role_override, status, directory_state, is_tenant_admin, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(tenant_id, identity_key) DO UPDATE SET open_id=excluded.open_id, user_id=excluded.user_id, union_id=excluded.union_id, name=excluded.name, email=excluded.email, mobile=excluded.mobile, department_ids=excluded.department_ids, directory_state='active', updated_at=excluded.updated_at""",
+                    (tenant_id, identity, _field_text(user.get("open_id")), _field_text(user.get("user_id")), _field_text(user.get("union_id")), _field_text(user.get("name")), _field_text(user.get("email")), _field_text(user.get("mobile")), json.dumps(user.get("department_ids") or [], ensure_ascii=False), (existing[0] if existing else None), (existing[1] if existing else "active"), "active", int(existing[2]) if existing else 0, self._now()),
+                )
+            if seen:
+                placeholders = ",".join("?" for _ in seen)
+                connection.execute(f"UPDATE members SET directory_state = 'missing', updated_at = ? WHERE tenant_id = ? AND identity_key NOT IN ({placeholders})", (self._now(), tenant_id, *seen))
+            connection.commit()
+        self._cache_expires_at = 0
+
+    async def save_member(self, member: Dict[str, Any], tenant_key: str = "") -> Dict[str, Any]:
+        identity = self._identity_key(member)
+        if not identity:
+            raise FeishuAPIError("成员缺少稳定身份标识")
+        tenant_id = self.tenant_id(tenant_key)
+        role = _field_text(member.get("role")).lower() or self.settings.default_role
+        status = _field_text(member.get("status")).lower() or "active"
+        with self._lock, self._connect() as connection:
+            existing = connection.execute("SELECT * FROM members WHERE tenant_id = ? AND identity_key = ?", (tenant_id, identity)).fetchone()
+            connection.execute(
+                """INSERT INTO members(tenant_id, identity_key, open_id, user_id, union_id, name, email, mobile, department_ids, role_override, status, directory_state, is_tenant_admin, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(tenant_id, identity_key) DO UPDATE SET open_id=excluded.open_id, user_id=excluded.user_id, union_id=excluded.union_id, name=excluded.name, email=excluded.email, mobile=excluded.mobile, department_ids=excluded.department_ids, role_override=excluded.role_override, status=excluded.status, is_tenant_admin=excluded.is_tenant_admin, updated_at=excluded.updated_at""",
+                (tenant_id, identity, _field_text(member.get("open_id")), _field_text(member.get("user_id")), _field_text(member.get("union_id")), _field_text(member.get("name")), _field_text(member.get("email")), _field_text(member.get("mobile")), json.dumps(member.get("department_ids") or [], ensure_ascii=False), None if role == self.settings.default_role else role, status, _field_text(existing["directory_state"] if existing else "active") or "active", int(bool(member.get("is_tenant_admin", bool(existing and existing["is_tenant_admin"])))), self._now()),
+            )
+            connection.commit()
+        self._cache_expires_at = 0
+        return (await self.member_for(member, tenant_key)) or {}
+
+    async def delete_member(self, member: Dict[str, Any], tenant_key: str = "") -> bool:
+        identity = self._identity_key(member)
+        tenant_id = self.tenant_id(tenant_key)
+        with self._lock, self._connect() as connection:
+            cursor = connection.execute("UPDATE members SET role_override = NULL, status = 'active', is_tenant_admin = 0, updated_at = ? WHERE tenant_id = ? AND identity_key = ?", (self._now(), tenant_id, identity))
+            connection.commit()
+        self._cache_expires_at = 0
+        return cursor.rowcount > 0
+
+    async def role_map(self, tenant_key: str = "") -> Dict[str, Dict[str, Any]]:
+        return (await self.snapshot(tenant_key))["roles"]
+
+    async def save_role(self, role: Dict[str, Any], tenant_key: str = "") -> Dict[str, Any]:
+        name = _field_text(role.get("name")).lower()
+        if not name:
+            raise FeishuAPIError("角色标识不能为空")
+        tenant_id = self.tenant_id(tenant_key)
+        now = self._now()
+        with self._lock, self._connect() as connection:
+            connection.execute(
+                """INSERT INTO roles(tenant_id, name, display_name, permissions, system, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(tenant_id, name) DO UPDATE SET display_name=excluded.display_name, permissions=excluded.permissions, updated_at=excluded.updated_at""",
+                (tenant_id, name, _field_text(role.get("display_name")) or name, json.dumps(_json_list(role.get("permissions")), ensure_ascii=False), int(name in DEFAULT_ROLES), now),
+            )
+            connection.commit()
+        self._cache_expires_at = 0
+        roles = await self.role_map(tenant_key)
+        return roles.get(name) or {}
+
+    async def delete_role(self, role_name: str, tenant_key: str = "") -> bool:
+        name = _field_text(role_name).lower()
+        if name in DEFAULT_ROLES:
+            raise FeishuAPIError("内置角色不能删除")
+        tenant_id = self.tenant_id(tenant_key)
+        with self._lock, self._connect() as connection:
+            refs = connection.execute("SELECT COUNT(*) FROM members WHERE tenant_id = ? AND role_override = ?", (tenant_id, name)).fetchone()[0]
+            if refs:
+                raise FeishuAPIError("角色仍被成员使用，请先重新分配成员")
+            cursor = connection.execute("DELETE FROM roles WHERE tenant_id = ? AND name = ?", (tenant_id, name))
+            connection.commit()
+        self._cache_expires_at = 0
+        return cursor.rowcount > 0
 
 
 class AuthService:
     def __init__(self, settings: Optional[AuthSettings] = None):
         self.settings = settings or AuthSettings.from_env()
         self.codec = SignedTokenCodec(self.settings.session_secret)
-        self.feishu = FeishuClient(self.settings)
-        self.store = BitablePermissionStore(self.settings, self.feishu)
-        self._organization_cache: Dict[str, Any] = {}
-        self._organization_expires_at = 0.0
+        self._clients: Dict[str, FeishuClient] = {}
+        self.feishu = self.feishu_for(self.settings.default_tenant_key)
+        self.store = SQLitePermissionStore(self.settings, self.feishu)
+        self._organization_cache: Dict[str, Dict[str, Any]] = {}
+        self._organization_expires_at: Dict[str, float] = {}
+        self._department_cache: Dict[str, List[Dict[str, Any]]] = {}
+        self._department_expires_at: Dict[str, float] = {}
 
-    def is_super_admin(self, user: Dict[str, Any]) -> bool:
-        expected = set(self.settings.super_admin_ids)
-        return bool(expected.intersection(_identity_values(user)))
+    def feishu_for(self, tenant_key: str = "") -> FeishuClient:
+        key = _field_text(tenant_key).lower() or self.settings.default_tenant_key
+        if self.settings.tenants is None and self._clients and key not in self._clients:
+            return next(iter(self._clients.values()))
+        if key not in self._clients:
+            self._clients[key] = FeishuClient(self.settings.settings_for_tenant(key))
+        return self._clients[key]
+
+    def tenant_config(self, tenant_key: str = "") -> Dict[str, Any]:
+        return self.settings.tenant_config(tenant_key)
+
+    def tenant_exists(self, tenant_key: str = "") -> bool:
+        key = _field_text(tenant_key).lower()
+        if not key:
+            return False
+        return key == self.settings.default_tenant_key or any(item.get("tenant_key") == key for item in self.list_tenants())
+
+    def list_tenants(self) -> List[Dict[str, Any]]:
+        stored = {item["tenant_key"]: item for item in self.store.list_tenants()}
+        configured = self.settings.tenants
+        # A tenant must have persisted application credentials to be usable. Database
+        # rows left by an interrupted onboarding flow are intentionally not exposed.
+        if configured is None:
+            configured = {}
+            keys = list(dict.fromkeys([self.settings.default_tenant_key, *stored.keys()]))
+        else:
+            keys = list(configured.keys())
+        if not keys:
+            keys = [self.settings.default_tenant_key]
+        result = []
+        for key in keys:
+            config = dict(configured.get(key) or {})
+            item = dict(stored.get(key) or {})
+            stored_name = _field_text(item.get("name"))
+            configured_name = _field_text(config.get("name"))
+            display_name = stored_name if stored_name and stored_name not in {key, _field_text(item.get("tenant_id"))} else (configured_name or key)
+            result.append({
+                "tenant_id": item.get("tenant_id") or self.store.tenant_id(key),
+                "tenant_key": key,
+                "slug": config.get("slug") or key,
+                "name": display_name,
+                "enabled": bool(item.get("enabled", config.get("enabled", True))),
+                "app_id": _field_text(config.get("app_id")),
+                "credential_configured": bool(config.get("app_id") and config.get("app_secret") and config.get("redirect_uris")),
+                "redirect_uris": list(config.get("redirect_uris") or []),
+            })
+        return result
+
+    def save_tenant(self, payload: Dict[str, Any], tenant_key: str = "") -> Dict[str, Any]:
+        key = _field_text(payload.get("tenant_key") or tenant_key).lower()
+        if not key or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", key):
+            raise FeishuAPIError("租户标识只能包含小写字母、数字、下划线或连字符")
+        tenants = {name: dict(config) for name, config in (self.settings.tenants or {}).items()}
+        existing = dict(tenants.get(key) or self.settings.tenant_config(key) or {})
+        app_id = _field_text(payload.get("app_id")) or _field_text(existing.get("app_id"))
+        app_secret = _field_text(payload.get("app_secret")) or _field_text(existing.get("app_secret"))
+        redirects = payload.get("redirect_uris")
+        if redirects is None:
+            redirects = existing.get("redirect_uris") or self.settings.allowed_redirect_uris
+        redirects = list(dict.fromkeys(_field_text(item) for item in (redirects or []) if _field_text(item)))
+        if not app_id or not app_secret or not redirects:
+            raise FeishuAPIError("企业认证需要 app_id、app_secret 和至少一个回调地址")
+        config = {
+            "tenant_key": key,
+            "slug": _field_text(payload.get("slug") or existing.get("slug") or key).lower(),
+            "name": _field_text(payload.get("name") or existing.get("name") or key),
+            "app_id": app_id,
+            "app_secret": app_secret,
+            "redirect_uris": redirects,
+            "enabled": bool(payload.get("enabled", existing.get("enabled", True))),
+        }
+        tenants[key] = config
+        _persist_tenant_configs(tenants)
+        self.settings = replace(self.settings, tenants=tenants)
+        self.store.settings = self.settings
+        self._clients.pop(key, None)
+        self.store.set_tenant_enabled(key, config["enabled"], config["name"])
+        if key == self.settings.default_tenant_key:
+            self.feishu = self.feishu_for(key)
+        return next(item for item in self.list_tenants() if item["tenant_key"] == key)
+
+    def remove_tenant(self, tenant_key: str) -> bool:
+        key = _field_text(tenant_key).lower()
+        if not key or not self.tenant_exists(key):
+            raise FeishuAPIError("企业不存在")
+        tenants = {name: dict(config) for name, config in (self.settings.tenants or {}).items()}
+        if len(self.list_tenants()) <= 1:
+            raise FeishuAPIError("至少保留一个企业，不能解除最后一个企业")
+        deleted = self.store.delete_tenant(key)
+        if not deleted:
+            raise FeishuAPIError("企业不存在")
+        tenants.pop(key, None)
+        if not tenants:
+            raise FeishuAPIError("至少保留一个企业，不能解除最后一个企业")
+        _persist_tenant_configs(tenants)
+        self.settings = replace(self.settings, tenants=tenants)
+        self.store.settings = self.settings
+        self._clients.pop(key, None)
+        self._organization_cache.pop(key, None)
+        self._organization_expires_at.pop(key, None)
+        return True
+
+    def is_tenant_enabled(self, tenant_key: str = "") -> bool:
+        return self.store.tenant_enabled(tenant_key)
+
+    def tenant_summary(self, tenant_key: str = "") -> Dict[str, Any]:
+        key = _field_text(tenant_key).lower() or self.settings.default_tenant_key
+        stored = next((item for item in self.store.list_tenants() if item.get("tenant_key") == key), {})
+        configured = self.tenant_config(key)
+        stored_name = _field_text(stored.get("name"))
+        configured_name = _field_text(configured.get("name"))
+        identifier_names = {key, _field_text(stored.get("tenant_id")), _field_text(configured.get("tenant_key"))}
+        looks_like_internal_id = bool(stored_name and (stored_name in identifier_names or re.fullmatch(r"[a-f0-9]{12,}", stored_name)))
+        if not stored_name or looks_like_internal_id:
+            stored_name = configured_name if configured_name and configured_name not in identifier_names else ""
+        if not stored_name:
+            stored_name = "默认企业" if key == self.settings.default_tenant_key else "当前企业"
+        return {
+            "tenant_key": key,
+            "name": stored_name,
+            "enabled": self.is_tenant_enabled(key),
+        }
+
+    async def refresh_tenant_display_name(self, tenant_key: str = "") -> Dict[str, Any]:
+        summary = self.tenant_summary(tenant_key)
+        key = summary["tenant_key"]
+        if summary["name"] not in {"当前企业", key} and not re.fullmatch(r"[a-f0-9]{12,}", summary["name"] or ""):
+            return summary
+        try:
+            root = await self.feishu_for(key).get_root_department()
+            name = _field_text(root.get("name"))
+            if name:
+                self.store.set_tenant_enabled(key, summary["enabled"], name)
+                summary["name"] = name
+        except FeishuAPIError:
+            pass
+        return summary
+
+    async def department_names_for_user(self, user: Dict[str, Any]) -> List[str]:
+        existing = [_field_text(item) for item in _json_list(user.get("department_names"))]
+        existing = [item for item in existing if item]
+        if existing:
+            return existing
+        department_ids = [_field_text(item) for item in _json_list(user.get("department_ids"))]
+        department_ids = [item for item in department_ids if item]
+        if not department_ids:
+            return []
+        tenant_key = _field_text(user.get("tenant_key")).lower() or self.settings.default_tenant_key
+        if not self._department_cache.get(tenant_key) or time.time() >= self._department_expires_at.get(tenant_key, 0):
+            try:
+                self._department_cache[tenant_key] = await self.feishu_for(tenant_key).list_departments()
+                self._department_expires_at[tenant_key] = time.time() + 300
+            except FeishuAPIError:
+                return []
+        names_by_id = {
+            _field_text(item.get("open_department_id") or item.get("department_id")): _field_text(item.get("name"))
+            for item in self._department_cache.get(tenant_key, [])
+        }
+        return list(dict.fromkeys(names_by_id.get(item, "") for item in department_ids if names_by_id.get(item)))
+
+    def is_super_admin(self, user: Dict[str, Any], tenant_key: str = "") -> bool:
+        tenant = _field_text(tenant_key or user.get("tenant_key")).lower() or self.settings.default_tenant_key
+        identities = _identity_values(user)
+        for raw in self.settings.super_admin_ids:
+            item = _field_text(raw)
+            if ":" in item:
+                expected_tenant, expected_identity = item.split(":", 1)
+                if expected_tenant.lower() == tenant and expected_identity in identities:
+                    return True
+            elif item in identities:
+                return True
+        return False
 
     async def resolve_profile(self, user: Dict[str, Any]) -> Dict[str, Any]:
         profile = dict(user)
-        super_admin = self.is_super_admin(profile)
-        member = None
-        if self.store.configured:
-            try:
-                member = await self.store.member_for(profile)
-            except FeishuAPIError as exc:
-                profile["permission_sync_error"] = str(exc)
+        tenant_key = _field_text(profile.get("tenant_key")).lower() or self.settings.default_tenant_key
+        profile["tenant_key"] = tenant_key
+        super_admin = self.is_super_admin(profile, tenant_key)
+        member = await self.store.member_for(profile, tenant_key)
+        if member:
+            for field in ("department_ids", "name", "email", "mobile", "avatar_url"):
+                value = member.get(field)
+                if value and not profile.get(field):
+                    profile[field] = value
         role_name = "admin" if super_admin else _field_text((member or {}).get("role") or profile.get("role") or self.settings.default_role).lower()
-        roles = dict(DEFAULT_ROLES)
-        if self.store.configured:
-            try:
-                roles = await self.store.role_map()
-            except FeishuAPIError as exc:
-                profile["permission_sync_error"] = str(exc)
+        roles = await self.store.role_map(tenant_key)
         role = roles.get(role_name) or roles.get(self.settings.default_role) or DEFAULT_ROLES["member"]
         permissions = list(role.get("permissions") or [])
+        tenant_admin = bool((member or {}).get("is_tenant_admin")) and role_name != "guest"
         if super_admin:
             permissions = sorted({permission for item in roles.values() for permission in item.get("permissions") or []})
-            permissions.extend(["organization:manage", "roles:manage"])
+            permissions.extend(["organization:manage", "roles:manage", "tenants:manage"])
+        elif tenant_admin:
+            permissions.extend([
+                "menu:organization-permissions",
+                "organization:view",
+                "organization:manage",
+                "roles:manage",
+            ])
+        if not super_admin:
+            permissions = [permission for permission in permissions if permission not in {"settings:api:manage", "settings:more:manage", "tenants:manage", "menu:api-settings", "menu:more-settings", "menu:workflow-settings"}]
+        status = "active" if super_admin else (member or {}).get("status") or "active"
+        if not self.is_tenant_enabled(tenant_key):
+            status = "disabled"
         profile.update({
+            "tenant_id": self.store.tenant_id(tenant_key),
             "role": role_name,
             "permissions": sorted(set(permissions)),
             "is_super_admin": super_admin,
+            "is_tenant_admin": tenant_admin,
             "read_only": role_name == "guest" or "action:write" not in permissions,
-            "status": "active" if super_admin else (member or {}).get("status") or "active",
+            "status": status,
         })
         return profile
 
@@ -606,14 +1150,18 @@ class AuthService:
         return {
             "sso_enabled": True,
             "sso_configured": self.settings.sso_configured,
-            "bitable_enabled": self.settings.bitable_configured,
+            "permission_store": "local",
             "missing_sso_fields": self.settings.missing_sso_fields(),
-            "missing_bitable_fields": self.settings.missing_bitable_fields(),
             "default_role": self.settings.default_role,
+            "default_tenant_key": self.settings.default_tenant_key,
+            "tenants": [
+                {"tenant_key": key, "slug": value.get("slug") or key, "name": value.get("name") or key, "enabled": self.is_tenant_enabled(key)}
+                for key, value in (self.settings.tenants or {}).items()
+            ],
         }
 
-    def redirect_uri_for_request(self, request: Request) -> str:
-        allowed = self.settings.allowed_redirect_uris
+    def redirect_uri_for_request(self, request: Request, tenant_key: str = "") -> str:
+        allowed = self.settings.settings_for_tenant(tenant_key).allowed_redirect_uris
         if not allowed:
             return ""
         request_origin = f"{request.url.scheme}://{request.url.netloc}".lower()
@@ -624,50 +1172,112 @@ class AuthService:
                 return candidate
         return allowed[0]
 
+    async def sync_directory(self, tenant_key: str = "", allow_unregistered: bool = False) -> Dict[str, Any]:
+        key = _field_text(tenant_key).lower() or self.settings.default_tenant_key
+        if not allow_unregistered and not self.tenant_exists(key):
+            raise FeishuAPIError("企业不存在")
+        if not self.is_tenant_enabled(key):
+            raise FeishuAPIError("企业已停用，不能同步成员")
+        client = self.feishu_for(key)
+        root_department = await client.get_root_department()
+        root_name = _field_text(root_department.get("name"))
+        departments = await client.list_departments()
+        if root_name:
+            root_department = {**root_department, "open_department_id": _field_text(root_department.get("open_department_id")) or "0", "name": root_name}
+            departments = [root_department, *[item for item in departments if _field_text(item.get("open_department_id") or item.get("department_id")) != "0"]]
+            current = next((item for item in self.list_tenants() if item.get("tenant_key") == key), {})
+            self.store.set_tenant_enabled(key, bool(current.get("enabled", True)), root_name)
+        self._department_cache[key] = departments
+        self._department_expires_at[key] = time.time() + 300
+        department_ids = [
+            _field_text(item.get("open_department_id") or item.get("department_id"))
+            for item in departments
+        ]
+        department_ids = [item for item in department_ids if item]
+        users_by_id: Dict[str, Dict[str, Any]] = {}
+        semaphore = asyncio.Semaphore(5)
+
+        async def load_department_users(department_id: str):
+            async with semaphore:
+                users = await client.list_users_for_department(department_id)
+                return department_id, users
+
+        unique_department_ids = list(dict.fromkeys(["0", *department_ids]))
+        user_groups = await asyncio.gather(*(load_department_users(item) for item in unique_department_ids))
+        for department_id, users_in_department in user_groups:
+            for directory_user in users_in_department:
+                key_value = _field_text(directory_user.get("open_id") or directory_user.get("user_id"))
+                if not key_value:
+                    continue
+                existing = users_by_id.get(key_value) or {}
+                merged = {**existing, **directory_user}
+                memberships = [*_json_list(existing.get("department_ids")), *_json_list(directory_user.get("department_ids"))]
+                if department_id != "0":
+                    memberships.append(department_id)
+                merged["department_ids"] = list(dict.fromkeys(item for item in memberships if item))
+                users_by_id[key_value] = merged
+        directory_users = list(users_by_id.values())
+        await self.store.sync_directory(directory_users, key)
+        self._organization_cache[key] = {"departments": departments, "directory_users": directory_users}
+        self._organization_expires_at[key] = time.time() + 60
+        return {"tenant_key": key, "departments": departments, "users": directory_users, "synced_at": int(time.time() * 1000)}
+
+    async def verify_tenant_connection(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        app_id = _field_text(payload.get("app_id"))
+        app_secret = _field_text(payload.get("app_secret"))
+        redirects = list(dict.fromkeys(_field_text(item) for item in (payload.get("redirect_uris") or []) if _field_text(item)))
+        if not app_id or not app_secret or not redirects:
+            raise FeishuAPIError("企业认证需要 App ID、App Secret 和至少一个回调地址")
+        candidate = AuthSettings(
+            app_id=app_id, app_secret=app_secret, redirect_uri=redirects[0], redirect_uris=redirects,
+            session_secret=self.settings.session_secret, super_admin_ids=self.settings.super_admin_ids,
+            cookie_secure=self.settings.cookie_secure, default_role=self.settings.default_role,
+            tenants=None, db_path=self.settings.db_path,
+        )
+        client = FeishuClient(candidate)
+        enterprise_name = ""
+        invitation_name = _field_text(payload.get("tenant_name"))
+        tenant_error: Optional[Exception] = None
+        try:
+            tenant = await client.get_tenant_info()
+            enterprise_name = _field_text(tenant.get("name") or tenant.get("tenant_name"))
+        except FeishuAPIError as exc:
+            tenant_error = exc
+        if not enterprise_name:
+            try:
+                root = await client.get_root_department()
+                enterprise_name = _field_text(root.get("name"))
+            except FeishuAPIError as exc:
+                tenant_error = exc
+        if not enterprise_name:
+            # Some test tenants return 404 for tenant/v2/tenant and hide the
+            # root department name. A successful directory read still proves
+            # the app is authorized; use the invitation label until sync can
+            # replace it with the real Feishu root department name.
+            try:
+                await client.list_departments()
+                enterprise_name = invitation_name
+            except FeishuAPIError as exc:
+                tenant_error = exc
+        if not enterprise_name:
+            detail = "已验证飞书应用身份，但读取企业名称失败。请确认已开通 tenant:tenant:readonly 或通讯录读取权限，并确认应用已发布、已授权当前企业后重试"
+            if tenant_error:
+                detail = f"{detail}（飞书接口：{tenant_error}）"
+            raise FeishuAPIError(detail)
+        return {"verified": True, "enterprise_name": enterprise_name}
+
     async def organization(self, current_user: Optional[Dict[str, Any]] = None, refresh: bool = False) -> Dict[str, Any]:
-        if refresh or not self._organization_cache or time.time() >= self._organization_expires_at:
-            departments = await self.feishu.list_departments()
-            department_ids = [
-                _field_text(item.get("open_department_id") or item.get("department_id"))
-                for item in departments
-            ]
-            department_ids = [item for item in department_ids if item]
-            users_by_id: Dict[str, Dict[str, Any]] = {}
-            semaphore = asyncio.Semaphore(5)
+        tenant_key = _field_text((current_user or {}).get("tenant_key")).lower() or self.settings.default_tenant_key
+        if refresh or not self._organization_cache.get(tenant_key) or time.time() >= self._organization_expires_at.get(tenant_key, 0):
+            await self.sync_directory(tenant_key, allow_unregistered=True)
 
-            async def load_department_users(department_id: str):
-                async with semaphore:
-                    users = await self.feishu.list_users_for_department(department_id)
-                    return department_id, users
-
-            unique_department_ids = list(dict.fromkeys(["0", *department_ids]))
-            user_groups = await asyncio.gather(*(load_department_users(item) for item in unique_department_ids))
-            for department_id, users_in_department in user_groups:
-                for directory_user in users_in_department:
-                    key = _field_text(directory_user.get("open_id") or directory_user.get("user_id"))
-                    if key:
-                        existing = users_by_id.get(key) or {}
-                        merged = {**existing, **directory_user}
-                        memberships = [
-                            *_json_list(existing.get("department_ids")),
-                            *_json_list(directory_user.get("department_ids")),
-                        ]
-                        if department_id != "0":
-                            memberships.append(department_id)
-                        merged["department_ids"] = list(dict.fromkeys(item for item in memberships if item))
-                        users_by_id[key] = merged
-            self._organization_cache = {
-                "departments": departments,
-                "directory_users": list(users_by_id.values()),
-            }
-            self._organization_expires_at = time.time() + 60
-
-        departments = self._organization_cache.get("departments") or []
-        directory_users = list(self._organization_cache.get("directory_users") or [])
+        organization_cache = self._organization_cache.get(tenant_key) or {}
+        departments = organization_cache.get("departments") or []
+        directory_users = list(organization_cache.get("directory_users") or [])
         current_ids = _identity_values(current_user)
         if current_user and current_ids and not any(current_ids.intersection(_identity_values(item)) for item in directory_users):
             directory_users.append(current_user)
-        snapshot = await self.store.snapshot()
+        snapshot = await self.store.snapshot(tenant_key)
         users = []
         for item in directory_users:
             assignment = next(
@@ -678,7 +1288,7 @@ class AuthService:
                 {},
             )
             is_current = bool(current_ids.intersection(_identity_values(item)))
-            is_super_admin = self.is_super_admin(item)
+            is_super_admin = self.is_super_admin(item, tenant_key)
             users.append({
                 "open_id": _field_text(item.get("open_id")),
                 "user_id": _field_text(item.get("user_id")),
@@ -690,6 +1300,7 @@ class AuthService:
                 "status": "active" if is_super_admin else assignment.get("status") or "active",
                 "is_current": is_current,
                 "is_super_admin": is_super_admin,
+                "is_tenant_admin": bool(assignment.get("is_tenant_admin")),
                 "managed": bool(assignment),
             })
         result = {
@@ -697,9 +1308,18 @@ class AuthService:
             "users": users,
             "roles": list(snapshot["roles"].values()),
             "source": snapshot["source"],
-            "tenant_key": _field_text((current_user or {}).get("tenant_key")),
+            "tenant_key": tenant_key,
+            "tenant": self.tenant_summary(tenant_key),
         }
         return result
+
+    def can_manage_organization(self, user: Optional[Dict[str, Any]], tenant_key: str = "") -> bool:
+        if not user:
+            return False
+        target = _field_text(tenant_key).lower() or self.settings.default_tenant_key
+        return self.is_super_admin(user, target) or (
+            bool(user.get("is_tenant_admin")) and _field_text(user.get("tenant_key")).lower() == target
+        )
 
 
 def _return_path(value: str) -> str:
@@ -709,7 +1329,32 @@ def _return_path(value: str) -> str:
     return text
 
 
+def _url_origin(value: str) -> str:
+    parsed = urllib.parse.urlsplit(str(value or "").strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+
 def register_auth(app, service: AuthService) -> None:
+    def is_trusted_return_origin(origin: str) -> bool:
+        normalized = _url_origin(origin)
+        if not normalized:
+            return False
+        configured_origins = {
+            _url_origin(uri)
+            for tenant in (service.settings.tenants or {}).values()
+            for uri in (tenant.get("redirect_uris") or [])
+        }
+        if normalized in configured_origins:
+            return True
+        parsed = urllib.parse.urlsplit(normalized)
+        return (
+            parsed.scheme == "http"
+            and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+            and parsed.port in {3000, 8000}
+        )
+
     async def auth_config():
         return service.public_config()
 
@@ -717,20 +1362,33 @@ def register_auth(app, service: AuthService) -> None:
         user = await service.current_user(request)
         if not user:
             raise HTTPException(status_code=401, detail="请使用飞书登录")
-        return {"user": user, "config": service.public_config()}
+        public_user = dict(user)
+        public_user["department_names"] = await service.department_names_for_user(public_user)
+        tenant = await service.refresh_tenant_display_name(public_user.get("tenant_key"))
+        return {
+            "user": public_user,
+            "tenant": tenant,
+            "config": service.public_config(),
+        }
 
-    async def auth_login(request: Request, return_to: str = "/"):
-        if not service.settings.sso_configured:
+    async def auth_login(request: Request, return_to: str = "/", tenant_slug: str = ""):
+        tenant_key = _field_text(tenant_slug or request.query_params.get("tenant") or service.settings.default_tenant_key).lower()
+        config = service.tenant_config(tenant_key)
+        if not service.tenant_exists(tenant_key) or not config or not config.get("enabled", True):
+            raise HTTPException(status_code=404, detail="企业租户不存在或已停用")
+        if not service.settings.sso_configured or not config.get("app_id") or not config.get("app_secret"):
             raise HTTPException(status_code=503, detail="飞书 SSO 缺少必要配置")
-        redirect_uri = service.redirect_uri_for_request(request)
+        redirect_uri = service.redirect_uri_for_request(request, tenant_key)
         nonce = secrets.token_urlsafe(24)
         state = service.codec.encode({
             "kind": "oauth",
             "nonce": nonce,
             "return_to": _return_path(return_to),
+            "return_origin": _url_origin(str(request.base_url)) if is_trusted_return_origin(str(request.base_url)) else "",
             "redirect_uri": redirect_uri,
+            "tenant_key": tenant_key,
         }, 600)
-        response = RedirectResponse(service.feishu.authorize_url(state, redirect_uri), status_code=302)
+        response = RedirectResponse(service.feishu_for(tenant_key).authorize_url(state, redirect_uri), status_code=302)
         response.set_cookie(
             OAUTH_STATE_COOKIE,
             state,
@@ -746,21 +1404,36 @@ def register_auth(app, service: AuthService) -> None:
         state_payload = service.codec.decode(state) if state and hmac.compare_digest(state, cookie_state) else None
         if not code or not state_payload or state_payload.get("kind") != "oauth":
             raise HTTPException(status_code=400, detail="飞书登录状态无效或已过期，请重新登录")
+        tenant_key = _field_text(state_payload.get("tenant_key")).lower() or service.settings.default_tenant_key
+        config = service.tenant_config(tenant_key)
+        if not config or not config.get("enabled", True):
+            raise HTTPException(status_code=404, detail="企业租户不存在或已停用")
         redirect_uri = _field_text(state_payload.get("redirect_uri"))
-        if redirect_uri not in service.settings.allowed_redirect_uris:
+        if redirect_uri not in service.settings.settings_for_tenant(tenant_key).allowed_redirect_uris:
             raise HTTPException(status_code=400, detail="飞书登录回调地址无效，请重新登录")
         try:
-            user = await service.feishu.exchange_code(code, redirect_uri)
+            client = service.feishu_for(tenant_key)
+            user = await client.exchange_code(code, redirect_uri)
         except FeishuAPIError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         try:
-            user = await service.feishu.get_user(user)
+            user = await client.get_user(user)
         except FeishuAPIError:
             # OAuth already supplied a verified identity. Contact permissions are
             # optional for sign-in and only enrich the profile/organization view.
             pass
-        session = service.codec.encode({"kind": "session", "user": user}, 12 * 60 * 60)
-        response = RedirectResponse(_return_path(state_payload.get("return_to") or "/"), status_code=302)
+        # Feishu's tenant_key is an external tenant identifier. It is not the
+        # platform's internal tenant slug (for example, "test"), so comparing
+        # the two would reject valid cross-tenant app logins. The OAuth code
+        # was exchanged with this tenant's own App ID/Secret, which binds the
+        # identity to the target app configuration.
+        user = {**user, "tenant_key": tenant_key}
+        await service.store.upsert_directory_user(user, tenant_key)
+        session = service.codec.encode({"kind": "session", "tenant_key": tenant_key, "user": user}, 12 * 60 * 60)
+        return_path = _return_path(state_payload.get("return_to") or "/")
+        return_origin = _url_origin(state_payload.get("return_origin"))
+        redirect_target = f"{return_origin}{return_path}" if is_trusted_return_origin(return_origin) else return_path
+        response = RedirectResponse(redirect_target, status_code=302)
         response.set_cookie(
             SESSION_COOKIE,
             session,
@@ -774,24 +1447,39 @@ def register_auth(app, service: AuthService) -> None:
 
     async def auth_logout():
         response = RedirectResponse("/static/login.html", status_code=302)
-        response.delete_cookie(SESSION_COOKIE)
+        response.delete_cookie(SESSION_COOKIE, path="/")
+        response.delete_cookie(OAUTH_STATE_COOKIE, path="/")
         return response
 
-    async def organization(request: Request, refresh: bool = False):
+    def requested_tenant(user: Optional[Dict[str, Any]], requested: str = "") -> str:
+        current = _field_text(user.get("tenant_key") if user else "").lower() or service.settings.default_tenant_key
+        target = _field_text(requested).lower() or current
+        if not requested and user and user.get("is_super_admin") and not service.tenant_exists(target):
+            target = service.settings.default_tenant_key
+        if target != current and not (user and user.get("is_super_admin")):
+            raise HTTPException(status_code=403, detail="只有平台超管可以切换企业")
+        if not service.tenant_exists(target):
+            raise HTTPException(status_code=404, detail="企业不存在")
+        return target
+
+    async def organization(request: Request, refresh: bool = False, tenant_key: str = ""):
         user = await service.current_user(request)
-        if not service.has_permission(user, "organization:view") and not service.has_permission(user, "organization:manage"):
+        target = requested_tenant(user, tenant_key)
+        if not (user and user.get("is_super_admin")) and not service.has_permission(user, "organization:view") and not service.has_permission(user, "organization:manage"):
             raise HTTPException(status_code=403, detail="没有查看组织与权限的权限")
         try:
             if refresh:
                 service.store._cache_expires_at = 0
-            return await service.organization(current_user=user, refresh=refresh)
+            scoped_user = {**(user or {}), "tenant_key": target}
+            return await service.organization(current_user=scoped_user, refresh=refresh)
         except FeishuAPIError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    async def save_member(request: Request, open_id: str, payload: Dict[str, Any] = Body(...)):
+    async def save_member(request: Request, open_id: str, payload: Dict[str, Any] = Body(...), tenant_key: str = ""):
         user = await service.current_user(request)
-        if not user or not user.get("is_super_admin"):
-            raise HTTPException(status_code=403, detail="只有超管可以修改成员授权")
+        tenant_key = requested_tenant(user, tenant_key)
+        if not service.can_manage_organization(user, tenant_key):
+            raise HTTPException(status_code=403, detail="没有管理当前企业成员的权限")
         member = {**payload, "open_id": open_id}
         role_name = _field_text(member.get("role")).lower() or "member"
         status = _field_text(member.get("status")).lower() or "active"
@@ -800,56 +1488,182 @@ def register_auth(app, service: AuthService) -> None:
         target_is_current_super_admin = bool(
             user.get("is_super_admin") and open_id in _identity_values(user)
         )
-        if (service.is_super_admin(member) or target_is_current_super_admin) and (
+        if (service.is_super_admin(member, tenant_key) or target_is_current_super_admin) and (
             role_name != "admin" or status != "active"
         ):
             raise HTTPException(status_code=400, detail="默认超管不可停用或降级")
+        if not user.get("is_super_admin"):
+            member["is_tenant_admin"] = bool((await service.store.member_for(member, tenant_key) or {}).get("is_tenant_admin"))
+        if role_name == "guest" and bool(member.get("is_tenant_admin")):
+            raise HTTPException(status_code=400, detail="访客不能设为企业管理员")
         try:
-            if role_name not in await service.store.role_map():
+            if role_name not in await service.store.role_map(tenant_key):
                 raise HTTPException(status_code=400, detail="成员角色不存在")
-            result = await service.store.save_member({**member, "role": role_name, "status": status})
-            service._organization_expires_at = 0
-            return result
+            result = await service.store.save_member({**member, "role": role_name, "status": status}, tenant_key)
+            service._organization_expires_at[tenant_key] = 0
+            return {**result, "role": result.get("role") or service.settings.default_role}
         except FeishuAPIError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    async def delete_member(request: Request, open_id: str):
+    async def delete_member(request: Request, open_id: str, tenant_key: str = ""):
         user = await service.current_user(request)
-        if not user or not user.get("is_super_admin"):
-            raise HTTPException(status_code=403, detail="只有超管可以移除成员授权")
-        if open_id in set(service.settings.super_admin_ids) or open_id in _identity_values(user):
+        tenant_key = requested_tenant(user, tenant_key)
+        if not service.can_manage_organization(user, tenant_key):
+            raise HTTPException(status_code=403, detail="没有管理当前企业成员的权限")
+        if service.is_super_admin({"open_id": open_id}, tenant_key) or open_id in _identity_values(user):
             raise HTTPException(status_code=400, detail="默认超管不可移除授权")
         try:
-            deleted = await service.store.delete_member({"open_id": open_id, "user_id": open_id})
-            service._organization_expires_at = 0
+            deleted = await service.store.delete_member({"open_id": open_id, "user_id": open_id}, tenant_key)
+            service._organization_expires_at[tenant_key] = 0
             return {"deleted": deleted}
         except FeishuAPIError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    async def save_role(request: Request, role_name: str, payload: Dict[str, Any] = Body(...)):
+    async def save_role(request: Request, role_name: str, payload: Dict[str, Any] = Body(...), tenant_key: str = ""):
         user = await service.current_user(request)
-        if not user or not user.get("is_super_admin"):
-            raise HTTPException(status_code=403, detail="只有超管可以修改角色")
+        tenant_key = requested_tenant(user, tenant_key)
+        if not service.can_manage_organization(user, tenant_key):
+            raise HTTPException(status_code=403, detail="没有管理当前企业角色的权限")
         role_name = role_name.strip().lower()
         if not role_name or not role_name.replace("-", "").replace("_", "").isalnum():
             raise HTTPException(status_code=400, detail="角色标识只能包含字母、数字、下划线或连字符")
+        permissions = list(dict.fromkeys(_json_list(payload.get("permissions"))))
+        if set(permissions) - ROLE_PERMISSION_ALLOWLIST:
+            raise HTTPException(status_code=400, detail="角色包含未知权限")
+        if not user.get("is_super_admin"):
+            existing_role = (await service.store.role_map(tenant_key)).get(role_name) or {}
+            existing_platform_permissions = set(existing_role.get("permissions") or []).intersection(PLATFORM_ONLY_PERMISSIONS)
+            requested_platform_permissions = set(permissions).intersection(PLATFORM_ONLY_PERMISSIONS)
+            if requested_platform_permissions != existing_platform_permissions:
+                raise HTTPException(status_code=403, detail="企业管理员不能修改平台设置权限")
         try:
-            result = await service.store.save_role({**payload, "name": role_name, "system": role_name in DEFAULT_ROLES})
-            service._organization_expires_at = 0
+            result = await service.store.save_role({**payload, "name": role_name, "permissions": permissions, "system": role_name in DEFAULT_ROLES}, tenant_key)
+            service._organization_expires_at[tenant_key] = 0
             return result
         except FeishuAPIError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+    async def list_tenants(request: Request):
+        user = await service.current_user(request)
+        if not user or not user.get("is_super_admin"):
+            raise HTTPException(status_code=403, detail="只有平台超管可以管理企业租户")
+        return {"tenants": service.list_tenants()}
+
+    async def create_tenant(request: Request, payload: Dict[str, Any] = Body(...)):
+        user = await service.current_user(request)
+        if not user or not user.get("is_super_admin"):
+            raise HTTPException(status_code=403, detail="只有平台超管可以管理企业租户")
+        try:
+            return service.save_tenant(payload)
+        except FeishuAPIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def update_tenant(request: Request, tenant_key: str, payload: Dict[str, Any] = Body(...)):
+        user = await service.current_user(request)
+        if not user or not user.get("is_super_admin"):
+            raise HTTPException(status_code=403, detail="只有平台超管可以管理企业租户")
+        try:
+            update = {**payload, "tenant_key": tenant_key}
+            return service.save_tenant(update)
+        except FeishuAPIError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def delete_tenant(request: Request, tenant_key: str):
+        user = await service.current_user(request)
+        if not user or not user.get("is_super_admin"):
+            raise HTTPException(status_code=403, detail="只有平台超管可以管理企业租户")
+        try:
+            return {"deleted": service.remove_tenant(tenant_key)}
+        except FeishuAPIError as exc:
+            status = 409 if "至少保留一个" in str(exc) else 400
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+    async def sync_tenant(request: Request, tenant_key: str):
+        user = await service.current_user(request)
+        if not user or not user.get("is_super_admin"):
+            raise HTTPException(status_code=403, detail="只有平台超管可以同步企业成员")
+        try:
+            result = await service.sync_directory(tenant_key)
+            return {"tenant_key": result["tenant_key"], "departments": len(result["departments"]), "members": len(result["users"]), "synced_at": result["synced_at"]}
+        except FeishuAPIError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    async def create_tenant_invitation(request: Request, payload: Dict[str, Any] = Body(...)):
+        user = await service.current_user(request)
+        if not user or not user.get("is_super_admin"):
+            raise HTTPException(status_code=403, detail="只有平台超管可以生成企业接入邀请")
+        try:
+            minutes = max(5, min(int(payload.get("expires_in_minutes") or 60), 1440))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="邀请有效期格式无效")
+        invitation = service.store.create_tenant_invitation(_field_text(payload.get("tenant_name")), minutes * 60)
+        origin = str(request.base_url).rstrip("/")
+        return {
+            "invite_url": f"{origin}/static/tenant-onboarding.html?token={urllib.parse.quote(invitation['token'])}",
+            "expires_at": invitation["expires_at"], "tenant_name": invitation["tenant_name"],
+        }
+
+    async def get_tenant_invitation(token: str):
+        invitation = service.store.tenant_invitation(token)
+        if not invitation:
+            raise HTTPException(status_code=404, detail="邀请链接无效")
+        if invitation["used"] or invitation["expired"]:
+            raise HTTPException(status_code=410, detail="邀请链接已使用或已过期")
+        return invitation
+
+    async def accept_tenant_invitation(token: str, payload: Dict[str, Any] = Body(...)):
+        tenant_key = _field_text(payload.get("tenant_key")).lower()
+        if service.tenant_exists(tenant_key):
+            raise HTTPException(status_code=409, detail="企业标识已存在")
+        if not service.store.claim_tenant_invitation(token):
+            raise HTTPException(status_code=410, detail="邀请链接已使用或已过期")
+        success = False
+        try:
+            verified = await service.verify_tenant_connection(payload)
+            saved = service.save_tenant({**payload, "name": verified["enterprise_name"], "enabled": True})
+            success = True
+            return {
+                "tenant": saved, "verified": True,
+                "login_url": "/",
+            }
+        except FeishuAPIError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        finally:
+            service.store.finish_tenant_invitation(token, success)
+
+    async def delete_role(request: Request, role_name: str, tenant_key: str = ""):
+        user = await service.current_user(request)
+        tenant_key = requested_tenant(user, tenant_key)
+        if not service.can_manage_organization(user, tenant_key):
+            raise HTTPException(status_code=403, detail="没有管理当前企业角色的权限")
+        try:
+            deleted = await service.store.delete_role(role_name, tenant_key)
+            service._organization_expires_at[tenant_key] = 0
+            return {"deleted": deleted}
+        except FeishuAPIError as exc:
+            status = 409 if "仍被成员使用" in str(exc) else 400
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+
     app.add_api_route("/api/auth/config", auth_config, methods=["GET"])
     app.add_api_route("/api/auth/me", auth_me, methods=["GET"])
     app.add_api_route("/api/auth/feishu/login", auth_login, methods=["GET"])
+    app.add_api_route("/t/{tenant_slug}/login", auth_login, methods=["GET"])
     app.add_api_route("/auth/callback", auth_callback, methods=["GET"])
     app.add_api_route("/api/auth/feishu/callback", auth_callback, methods=["GET"])
     app.add_api_route("/api/auth/logout", auth_logout, methods=["GET", "POST"])
     app.add_api_route("/api/admin/organization", organization, methods=["GET"])
+    app.add_api_route("/api/admin/tenants", list_tenants, methods=["GET"])
+    app.add_api_route("/api/admin/tenants", create_tenant, methods=["POST"])
+    app.add_api_route("/api/admin/tenants/{tenant_key}", update_tenant, methods=["PUT"])
+    app.add_api_route("/api/admin/tenants/{tenant_key}", delete_tenant, methods=["DELETE"])
+    app.add_api_route("/api/admin/tenants/{tenant_key}/sync", sync_tenant, methods=["POST"])
+    app.add_api_route("/api/admin/tenant-invitations", create_tenant_invitation, methods=["POST"])
+    app.add_api_route("/api/tenant-invitations/{token}", get_tenant_invitation, methods=["GET"])
+    app.add_api_route("/api/tenant-invitations/{token}/accept", accept_tenant_invitation, methods=["POST"])
     app.add_api_route("/api/admin/members/{open_id}", save_member, methods=["PUT"])
     app.add_api_route("/api/admin/members/{open_id}", delete_member, methods=["DELETE"])
     app.add_api_route("/api/admin/roles/{role_name}", save_role, methods=["PUT"])
+    app.add_api_route("/api/admin/roles/{role_name}", delete_role, methods=["DELETE"])
 
 
 PUBLIC_AUTH_PATHS = {
@@ -865,6 +1679,9 @@ SENSITIVE_STATIC_PERMISSIONS = {
     "/static/api-settings.html": "menu:api-settings",
     "/static/comfyui-settings.html": "menu:workflow-settings",
     "/static/org-permissions.html": "menu:organization-permissions",
+}
+DISABLED_LOCAL_STATIC_PATHS = {
+    "/static/zimage.html", "/static/enhance.html", "/static/klein.html", "/static/angle.html",
 }
 
 
@@ -887,8 +1704,10 @@ def _management_permission(path: str, method: str) -> str:
 async def auth_middleware(service: AuthService, request: Request, call_next):
     path = request.url.path
     method = request.method.upper()
-    if path in PUBLIC_AUTH_PATHS or path == "/static/login.html" or path.startswith("/static/images/") or path.startswith("/static/vendor/"):
+    if path in PUBLIC_AUTH_PATHS or path.startswith("/api/tenant-invitations/") or (path.startswith("/t/") and path.endswith("/login")) or path in {"/static/login.html", "/static/tenant-onboarding.html"} or path.startswith("/static/images/") or path.startswith("/static/vendor/"):
         return await call_next(request)
+    if path in DISABLED_LOCAL_STATIC_PATHS:
+        return RedirectResponse("/")
     try:
         user = await service.current_user(request)
     except FeishuAPIError as exc:

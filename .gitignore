@@ -27,6 +27,11 @@ codex-home/
 *.tar
 *.tar.gz
 
+# Codex project instructions and private documentation are local-only.
+# Keep public product/deployment documentation outside this tree.
+/AGENTS.md
+/.codex/project-docs/
+
 # Local-only operational records and production replacements
 .local-private/
 HANDOFF.md
