@@ -333,13 +333,12 @@ SUPPORTED_IMAGE_REQUEST_MODES = {"openai", "openai-json", "openai-video-proxy", 
 RUNNINGHUB_DEFAULT_BASE_URL = "https://www.runninghub.cn"
 RUNNINGHUB_OPENAPI_BASE_URL = "https://www.runninghub.cn/openapi/v2"
 RUNNINGHUB_MODEL_REGISTRY_URL = "https://raw.githubusercontent.com/HM-RunningHub/ComfyUI_RH_OpenAPI/main/models_registry.json"
-RUNNINGHUB_LLM_BASE_URL = "https://llm.runninghub.cn/v1"
+RUNNINGHUB_LLM_BASE_URL = "https://llm.runninghub.ai/v1"
 RUNNINGHUB_FILE_HOST_REWRITES = {
     "rh-images-1252422369.cos.ap-beijing.myqcloud.com": "rh-images.xiaoyaoyou.com",
 }
 LINGJING_DEFAULT_BASE_URL = "https://apistudio.vip"
 RUNNINGHUB_LLM_MODELS_URLS = [
-    "https://llm.runninghub.cn/v1/models",
     "https://llm.runninghub.ai/v1/models",
 ]
 RUNNINGHUB_FALLBACK_CHAT_MODELS = [
@@ -1336,6 +1335,86 @@ def save_api_providers(providers):
             f.flush()
             os.fsync(f.fileno())
         os.replace(temp_path, API_PROVIDERS_FILE)
+
+def default_runninghub_static_provider():
+    return {
+        "id": "runninghub",
+        "name": "RunningHub",
+        "base_url": RUNNINGHUB_DEFAULT_BASE_URL,
+        "protocol": "runninghub",
+        "image_generation_endpoint": "",
+        "image_edit_endpoint": "",
+        "enabled": True,
+        "primary": False,
+        "image_models": [],
+        "chat_models": [],
+        "video_models": [],
+        "model_protocols": {},
+        "ms_loras": [],
+        "ms_defaults_version": 0,
+        "rh_apps": [],
+        "rh_workflows": [],
+    }
+
+def mutate_static_runninghub_provider(mutator):
+    os.makedirs(STATIC_RUNNINGHUB_DIR, exist_ok=True)
+    raw = []
+    if os.path.exists(STATIC_RUNNINGHUB_API_PROVIDERS_FILE):
+        try:
+            with open(STATIC_RUNNINGHUB_API_PROVIDERS_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception as exc:
+            print(f"读取 static RunningHub 模板失败，将重建基础模板: {exc}")
+            raw = []
+    if isinstance(raw, dict) and str(raw.get("id") or "").strip().lower() == "runninghub":
+        provider = raw
+    else:
+        if isinstance(raw, list):
+            providers = raw
+        elif isinstance(raw, dict):
+            providers = raw.setdefault("providers", [])
+            if not isinstance(providers, list):
+                providers = []
+                raw["providers"] = providers
+        else:
+            raw = []
+            providers = raw
+        provider = next((
+            item for item in providers
+            if isinstance(item, dict) and str(item.get("id") or "").strip().lower() == "runninghub"
+        ), None)
+        if provider is None:
+            provider = default_runninghub_static_provider()
+            providers.append(provider)
+    changed = mutator(provider)
+    if changed is False:
+        return False
+    with open(STATIC_RUNNINGHUB_API_PROVIDERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    return True
+
+def sync_runninghub_provider_workflows_to_static_template(provider):
+    if not isinstance(provider, dict) or str(provider.get("id") or "").strip().lower() != "runninghub":
+        return False
+    workflows = []
+    seen = set()
+    for entry in normalize_runninghub_entries(provider.get("rh_workflows") or [], "workflow"):
+        key = runninghub_workflow_store_key(entry.get("workflowId") or entry.get("id"))
+        if not key or entry.get("hidden") is True or key in seen:
+            continue
+        seen.add(key)
+        workflows.append(entry)
+    def apply_workflows(static_provider):
+        static_provider["id"] = "runninghub"
+        static_provider["name"] = static_provider.get("name") or "RunningHub"
+        static_provider["base_url"] = static_provider.get("base_url") or RUNNINGHUB_DEFAULT_BASE_URL
+        static_provider["protocol"] = "runninghub"
+        static_provider["rh_workflows"] = workflows
+        if "rh_apps" not in static_provider or not isinstance(static_provider.get("rh_apps"), list):
+            static_provider["rh_apps"] = []
+        return True
+    return mutate_static_runninghub_provider(apply_workflows)
 
 def public_provider(provider):
     if provider.get("id") == "runninghub":
@@ -2815,6 +2894,17 @@ class SmartCanvasGroupExportRequest(BaseModel):
     group_name: str = "group"
     items: List[SmartCanvasGroupExportItem] = []
 
+class MiniMaxTimelineClip(BaseModel):
+    url: str = ""
+    name: str = ""
+    start: float = 0
+    end: float = 0
+    duration: float = 0
+
+class MiniMaxTimelineExportRequest(BaseModel):
+    clips: List[MiniMaxTimelineClip] = []
+    filename: str = "minimax-timeline.mp4"
+
 class LocalImageImportRequest(BaseModel):
     path: str = ""
     paths: List[str] = Field(default_factory=list)
@@ -2973,10 +3063,49 @@ def collect_required_comfy_media(params: Dict[str, Any]) -> List[str]:
     for node_inputs in (params or {}).values():
         if not isinstance(node_inputs, dict):
             continue
-        for input_name, value in node_inputs.items():
+        scan_inputs = node_inputs.get("inputs") if isinstance(node_inputs.get("inputs"), dict) else node_inputs
+        for input_name, value in scan_inputs.items():
             if is_comfy_input_media_value(input_name, value):
                 required.append(value)
     return list(dict.fromkeys(required))
+
+def comfy_prompt_error_message(status_code: int, error_body: str) -> str:
+    """Turn ComfyUI's validation payload into a useful canvas error."""
+    fallback = str(error_body or "").strip()
+    try:
+        payload = json.loads(fallback)
+    except (TypeError, ValueError):
+        return f"ComfyUI 请求失败（HTTP {status_code}）：{fallback[:500] or '未知错误'}"
+
+    parts = []
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        message = str(error.get("message") or "").strip()
+        details = str(error.get("details") or "").strip()
+        if message:
+            parts.append(message)
+        if details and details not in parts:
+            parts.append(details)
+
+    node_errors = payload.get("node_errors") if isinstance(payload, dict) else None
+    if isinstance(node_errors, dict):
+        for node_id, node_error in list(node_errors.items())[:3]:
+            if not isinstance(node_error, dict):
+                continue
+            class_type = str(node_error.get("class_type") or "").strip()
+            messages = []
+            for item in node_error.get("errors") or []:
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("message") or item.get("details") or "").strip()
+                if text and text not in messages:
+                    messages.append(text)
+            if messages:
+                label = f"节点 {node_id}" + (f"（{class_type}）" if class_type else "")
+                parts.append(f"{label}：{'；'.join(messages[:2])}")
+
+    detail = "；".join(part for part in parts if part).strip()
+    return f"ComfyUI 拒绝了工作流（HTTP {status_code}）：{detail[:700] or fallback[:500] or '工作流校验失败'}"
 
 def get_best_backend(required_images: List[str] = None):
     best_backend = COMFYUI_INSTANCES[0]
@@ -10061,8 +10190,9 @@ def runninghub_api_key(provider=None, use_wallet=False, prefer_wallet=False):
     return api_key
 
 def runninghub_app_headers(json_body=True, use_wallet=False, provider=None):
-    headers = {"Host": "www.runninghub.cn"}
     provider = provider or runninghub_provider()
+    host = urllib.parse.urlsplit(str((provider or {}).get("base_url") or RUNNINGHUB_DEFAULT_BASE_URL)).netloc or "www.runninghub.ai"
+    headers = {"Host": host}
     if provider:
         api_key = runninghub_api_key(provider, use_wallet=use_wallet)
         if api_key:
@@ -10188,6 +10318,22 @@ def runninghub_fail_reason(raw):
     if isinstance(raw, dict) and raw.get("errorCode"):
         return f"RunningHub errorCode={raw.get('errorCode')}"
     return ""
+
+def runninghub_error_detail(message, raw=None, **extra):
+    detail = {"message": str(message or "RunningHub 请求失败")}
+    detail.update({k: v for k, v in extra.items() if v not in (None, "")})
+    if raw is not None:
+        detail["raw"] = raw
+    return detail
+
+def log_runninghub_error(stage, raw=None, **extra):
+    try:
+        payload = {"stage": stage, **{k: v for k, v in extra.items() if v not in (None, "")}}
+        if raw is not None:
+            payload["raw"] = raw
+        print(f"RunningHub error: {json.dumps(payload, ensure_ascii=False)[:4000]}")
+    except Exception:
+        print(f"RunningHub error: {stage}")
 
 def runninghub_infer_workflow_field_type(field_name, field_value):
     key = f"{field_name or ''} {field_value or ''}".lower()
@@ -11867,6 +12013,91 @@ def download_output(request: Request, url: str, name: str = "", inline: bool = F
 
     return StreamingResponse(stream_remote(), media_type=content_type, headers=headers, status_code=upstream.status_code)
 
+@app.post("/api/smart-canvas/minimax-export")
+async def export_minimax_timeline(payload: MiniMaxTimelineExportRequest):
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise HTTPException(status_code=500, detail="未找到 ffmpeg，无法导出完整剪辑")
+    clips = [clip for clip in (payload.clips or []) if clip.url]
+    if not clips:
+        raise HTTPException(status_code=400, detail="时间轴里还没有可导出的视频")
+    tmpdir = tempfile.mkdtemp(prefix="minimax_timeline_")
+    try:
+        clip_sources = []
+        for clip in clips:
+            src = output_file_from_url(clip.url)
+            if not src:
+                raise HTTPException(status_code=400, detail="完整剪辑导出只支持本地生成素材")
+            clip_sources.append(src)
+        ffprobe = shutil.which("ffprobe")
+        preserve_audio = bool(ffprobe)
+        if ffprobe:
+            for src in clip_sources:
+                probe_cmd = [
+                    ffprobe, "-v", "error", "-select_streams", "a:0",
+                    "-show_entries", "stream=index", "-of", "csv=p=0", src,
+                ]
+                probe = await asyncio.to_thread(subprocess.run, probe_cmd, capture_output=True, text=True, timeout=30)
+                if probe.returncode != 0 or not (probe.stdout or "").strip():
+                    preserve_audio = False
+                    break
+        part_paths = []
+        normalize_video = "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30"
+        for index, (clip, src) in enumerate(zip(clips, clip_sources)):
+            start = max(0.0, float(clip.start or 0))
+            end = float(clip.end or 0)
+            source_duration = max(0.0, float(clip.duration or 0))
+            if end <= start:
+                end = source_duration if source_duration > start else start + 0.1
+            trim_duration = max(0.1, end - start)
+            part_path = os.path.join(tmpdir, f"part_{index:03d}.mp4")
+            if preserve_audio:
+                cmd = [
+                    ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                    "-ss", f"{start:.3f}", "-t", f"{trim_duration:.3f}", "-i", src,
+                    "-map", "0:v:0", "-map", "0:a:0", "-vf", normalize_video,
+                    "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-ar", "48000", "-ac", "2",
+                    "-movflags", "+faststart", part_path,
+                ]
+            else:
+                cmd = [
+                    ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                    "-ss", f"{start:.3f}", "-t", f"{trim_duration:.3f}", "-i", src,
+                    "-f", "lavfi", "-t", f"{trim_duration:.3f}", "-i", "anullsrc=channel_layout=stereo:sample_rate=48000",
+                    "-map", "0:v:0", "-map", "1:a:0", "-vf", normalize_video, "-shortest",
+                    "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-ar", "48000", "-ac", "2",
+                    "-movflags", "+faststart", part_path,
+                ]
+            proc = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=300)
+            if proc.returncode != 0:
+                raise HTTPException(status_code=500, detail=(proc.stderr or "视频裁剪失败").strip()[:300])
+            part_paths.append(part_path)
+        filename = sanitize_export_filename(payload.filename or "minimax-timeline.mp4", "minimax-timeline.mp4")
+        if not filename.lower().endswith(".mp4"):
+            filename += ".mp4"
+        output_path = output_path_for(filename, "output")
+        if len(part_paths) == 1:
+            shutil.copyfile(part_paths[0], output_path)
+        else:
+            concat_path = os.path.join(tmpdir, "concat.txt")
+            with open(concat_path, "w", encoding="utf-8") as fh:
+                for part in part_paths:
+                    safe_part = part.replace("\\", "/").replace("'", "'\\''")
+                    fh.write(f"file '{safe_part}'\n")
+            cmd = [
+                ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "concat", "-safe", "0", "-i", concat_path,
+                "-c", "copy", "-movflags", "+faststart", output_path,
+            ]
+            proc = await asyncio.to_thread(subprocess.run, cmd, capture_output=True, text=True, timeout=300)
+            if proc.returncode != 0:
+                raise HTTPException(status_code=500, detail=(proc.stderr or "视频拼接失败").strip()[:300])
+        return {"url": output_url_for(filename, "output"), "name": filename, "kind": "video"}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
 @app.post("/api/upload")
 async def upload_image(files: List[UploadFile] = File(...)):
     uploaded_files = []
@@ -12707,15 +12938,17 @@ async def runninghub_submit(payload: RunningHubSubmitRequest):
             response = await client.post(url, headers=runninghub_app_headers(True, payload.useWallet), json=body)
             raw = response.json()
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"提交 RunningHub 任务失败：{exc}") from exc
+            raise HTTPException(status_code=502, detail=runninghub_error_detail(f"提交 RunningHub 任务失败：{exc}", endpoint=url, webappId=webapp_id)) from exc
     if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=json.dumps(raw, ensure_ascii=False)[:800])
+        log_runninghub_error("submit-http", raw, endpoint=url, webappId=webapp_id, status=response.status_code)
+        raise HTTPException(status_code=response.status_code, detail=runninghub_error_detail(f"RunningHub HTTP {response.status_code}", raw, endpoint=url, webappId=webapp_id))
     if isinstance(raw, dict) and raw.get("code") in (0, "0"):
         task_id = raw.get("data", {}).get("taskId") if isinstance(raw.get("data"), dict) else ""
         if not task_id:
-            raise HTTPException(status_code=502, detail=f"RunningHub 未返回 taskId：{raw}")
+            raise HTTPException(status_code=502, detail=runninghub_error_detail("RunningHub 未返回 taskId", raw, endpoint=url, webappId=webapp_id))
         return {"success": True, "data": {"taskId": task_id, "raw": raw}}
-    raise HTTPException(status_code=400, detail=(raw.get("msg") if isinstance(raw, dict) else "") or f"RunningHub 提交失败：{raw}")
+    log_runninghub_error("submit-rejected", raw, endpoint=url, webappId=webapp_id)
+    raise HTTPException(status_code=400, detail=runninghub_error_detail(runninghub_fail_reason(raw) or "RunningHub 提交失败", raw, endpoint=url, webappId=webapp_id))
 
 @app.post("/api/runninghub/workflow-submit")
 async def runninghub_workflow_submit(payload: RunningHubWorkflowSubmitRequest):
@@ -12743,15 +12976,17 @@ async def runninghub_workflow_submit(payload: RunningHubWorkflowSubmitRequest):
             response = await client.post(url, headers=runninghub_app_headers(True, payload.useWallet), json=body)
             raw = response.json()
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"提交 RunningHub 工作流失败：{exc}") from exc
+            raise HTTPException(status_code=502, detail=runninghub_error_detail(f"提交 RunningHub 工作流失败：{exc}", endpoint=url, workflowId=workflow_id)) from exc
     if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=json.dumps(raw, ensure_ascii=False)[:800])
+        log_runninghub_error("workflow-submit-http", raw, endpoint=url, workflowId=workflow_id, status=response.status_code)
+        raise HTTPException(status_code=response.status_code, detail=runninghub_error_detail(f"RunningHub HTTP {response.status_code}", raw, endpoint=url, workflowId=workflow_id))
     if isinstance(raw, dict) and raw.get("code") in (0, "0"):
         task_id = raw.get("data", {}).get("taskId") if isinstance(raw.get("data"), dict) else ""
         if not task_id:
-            raise HTTPException(status_code=502, detail=f"RunningHub 工作流未返回 taskId：{raw}")
+            raise HTTPException(status_code=502, detail=runninghub_error_detail("RunningHub 工作流未返回 taskId", raw, endpoint=url, workflowId=workflow_id))
         return {"success": True, "data": {"taskId": task_id, "raw": raw}}
-    raise HTTPException(status_code=400, detail=(raw.get("msg") if isinstance(raw, dict) else "") or f"RunningHub 工作流提交失败：{raw}")
+    log_runninghub_error("workflow-submit-rejected", raw, endpoint=url, workflowId=workflow_id)
+    raise HTTPException(status_code=400, detail=runninghub_error_detail(runninghub_fail_reason(raw) or "RunningHub 工作流提交失败", raw, endpoint=url, workflowId=workflow_id))
 
 @app.get("/api/runninghub/workflow-info")
 async def runninghub_workflow_info(workflowId: str = ""):
@@ -12926,9 +13161,10 @@ async def runninghub_query(taskId: str = "", useWallet: bool = False):
             response = await client.post(url, headers=runninghub_app_headers(True, useWallet), json={"apiKey": api_key, "taskId": task_id})
             raw = response.json()
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"查询 RunningHub 任务失败：{exc}") from exc
+            raise HTTPException(status_code=502, detail=runninghub_error_detail(f"查询 RunningHub 任务失败：{exc}", endpoint=url, taskId=task_id)) from exc
         if response.status_code >= 400:
-            raise HTTPException(status_code=response.status_code, detail=json.dumps(raw, ensure_ascii=False)[:800])
+            log_runninghub_error("query-http", raw, endpoint=url, taskId=task_id, status=response.status_code)
+            raise HTTPException(status_code=response.status_code, detail=runninghub_error_detail(f"RunningHub HTTP {response.status_code}", raw, endpoint=url, taskId=task_id))
         code = raw.get("code") if isinstance(raw, dict) else None
         status = "PENDING"
         urls = []
@@ -12948,8 +13184,10 @@ async def runninghub_query(taskId: str = "", useWallet: bool = False):
             status = "QUEUED"
         elif code in (805, "805"):
             status = "FAILED"
+            log_runninghub_error("query-failed", raw, endpoint=url, taskId=task_id, code=code)
         else:
             status = "UNKNOWN"
+            log_runninghub_error("query-unknown", raw, endpoint=url, taskId=task_id, code=code)
         return {"success": True, "data": {"status": status, "urls": urls, "image_items": image_items, "failReason": runninghub_fail_reason(raw), "code": code, "raw": raw}}
 
 @app.post("/api/runninghub/upload-asset")
@@ -13353,6 +13591,9 @@ async def save_providers(payload: List[ApiProviderPayload]):
         for i, p in enumerate(providers):
             p["primary"] = (i == winner)
     save_api_providers(providers)
+    runninghub_provider = next((item for item in providers if item.get("id") == "runninghub"), None)
+    if runninghub_provider:
+        sync_runninghub_provider_workflows_to_static_template(runninghub_provider)
     if env_updates:
         update_env_values(env_updates)
         reload_env_globals()   # 立即将最新 env 值同步回模块全局变量，无需重启
@@ -15820,6 +16061,9 @@ async def canvas_video(payload: CanvasVideoRequest):
                 for ref_url in payload.videos[:3]:
                     ref_url = str(ref_url or "").strip()
                     if not ref_url:
+                        continue
+                    if looks_like_image_media_url(ref_url):
+                        invalid_videos.append((ref_url, "该地址是图片，不能作为参考视频。请将图片放入图片输入。"))
                         continue
                     normalized_video_url = await upload_video_for_apimart(client, provider, ref_url)
                     if valid_apimart_video_image_input(normalized_video_url):
@@ -18747,7 +18991,16 @@ def generate(req: GenerateRequest):
                 if "inputs" not in workflow[node_id]:
                     workflow[node_id]["inputs"] = {}
                 for input_name, value in node_inputs.items():
+                    if value is None:
+                        workflow[node_id]["inputs"].pop(input_name, None)
+                        continue
                     workflow[node_id]["inputs"][input_name] = value
+            elif isinstance(node_inputs, dict) and node_inputs.get("class_type") and isinstance(node_inputs.get("inputs"), dict):
+                workflow[str(node_id)] = {
+                    "class_type": str(node_inputs.get("class_type")),
+                    "inputs": node_inputs.get("inputs") or {},
+                    "_meta": node_inputs.get("_meta") if isinstance(node_inputs.get("_meta"), dict) else {"title": str(node_inputs.get("class_type"))},
+                }
 
         p = {"prompt": workflow, "client_id": CLIENT_ID}
         data = json.dumps(p).encode('utf-8')
@@ -18756,7 +19009,7 @@ def generate(req: GenerateRequest):
             prompt_id = json.loads(urllib.request.urlopen(post_req, timeout=10).read())['prompt_id']
         except urllib.error.HTTPError as e:
             error_body = e.read().decode('utf-8')
-            raise Exception(f"HTTP Error {e.code}: {error_body}")
+            raise Exception(comfy_prompt_error_message(e.code, error_body))
 
         history_data = None
         for i in range(COMFYUI_HISTORY_TIMEOUT):
@@ -19197,7 +19450,11 @@ def sync_runninghub_workflow_to_provider(cfg):
         entry["enabled"] = True
     if "thumbnail" not in entry:
         entry["thumbnail"] = ""
-    save_api_providers([normalize_provider(item) for item in providers])
+    normalized_providers = [normalize_provider(item) for item in providers]
+    save_api_providers(normalized_providers)
+    runninghub_provider = next((item for item in normalized_providers if item.get("id") == "runninghub"), None)
+    if runninghub_provider:
+        sync_runninghub_provider_workflows_to_static_template(runninghub_provider)
 
 def remove_runninghub_workflow_from_provider(workflow_id: str):
     key = runninghub_workflow_store_key(workflow_id)
@@ -19230,7 +19487,11 @@ def remove_runninghub_workflow_from_provider(workflow_id: str):
             provider["rh_workflows"] = kept
             changed = True
     if changed:
-        save_api_providers([normalize_provider(item) for item in providers])
+        normalized_providers = [normalize_provider(item) for item in providers]
+        save_api_providers(normalized_providers)
+        runninghub_provider = next((item for item in normalized_providers if item.get("id") == "runninghub"), None)
+        if runninghub_provider:
+            sync_runninghub_provider_workflows_to_static_template(runninghub_provider)
 
 def runninghub_workflow_store_key(workflow_id: str) -> str:
     return str(workflow_id or "").strip()
