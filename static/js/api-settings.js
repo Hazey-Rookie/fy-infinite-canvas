@@ -160,7 +160,7 @@ const RECOMMENDED_APIS = [
         category:'value',
         base_url:'https://api.ai-tudou.net',
         protocol:'openai',
-        image_request_mode:'openai',
+        image_request_mode:'tudou-async',
         register_url:'https://api.ai-tudou.net/register?aff=GmBu',
         tagKeys:['api.tagImageModels','api.tagVideoModels','api.tagLlmModels'],
         icons:['IMG','VID','LLM'],
@@ -2883,7 +2883,7 @@ function currentProviderApiKey(item){
 }
 function normalizeImageRequestMode(value){
     const mode = String(value || '').trim().toLowerCase();
-    return ['openai', 'openai-json', 'openai-video-proxy', 'openai-responses', 'openai-async-image'].includes(mode) ? mode : 'openai';
+    return ['openai', 'openai-json', 'openai-video-proxy', 'openai-responses', 'openai-async-image', 'tudou-async'].includes(mode) ? mode : 'openai';
 }
 function normalizeImageSizePolicy(value){
     const policy = String(value || '').trim().toLowerCase();
@@ -2899,6 +2899,7 @@ function imageRequestModeLabel(mode){
     if(normalized === 'openai-video-proxy') return 'OpenAI 中转';
     if(normalized === 'openai-responses') return 'OpenAI RS';
     if(normalized === 'openai-async-image') return 'OpenAI 异步图片';
+    if(normalized === 'tudou-async') return '土豆 GPT-Image-2 异步';
     return 'OpenAI 标准';
 }
 function isRunningHubContext(item, baseUrl=''){
@@ -2980,6 +2981,15 @@ async function probeAsync(){
     if(!item) return;
     const btn = document.getElementById('probeAsyncBtn');
     const baseUrl = baseInput.value.trim();
+    let isTudouHost = false;
+    try {
+        const host = new URL(baseUrl).hostname.toLowerCase();
+        isTudouHost = host === 'api.ai-tudou.net' || host.endsWith('.ai-tudou.net');
+    } catch(e) {}
+    if(isTudouHost && imageRequestModeInput){
+        item.image_request_mode = 'tudou-async';
+        imageRequestModeInput.value = 'tudou-async';
+    }
     const isCliProtocol = CLI_PROTOCOLS.has(String(protocolInput?.value || item.protocol || '').toLowerCase());
     if(!baseUrl && !isCliProtocol){ alert('请先填写请求地址'); return; }
     if(btn){ btn.disabled = true; btn.querySelector('span').textContent = '检测中...'; }
@@ -3031,6 +3041,7 @@ async function probeAsync(){
             applyDetectedProtocol(detectedProtocol || (isAsync ? 'apimart' : 'openai'));
         }
         if(data.image_request_mode) applyDetectedImageRequestMode(data.image_request_mode);
+        if(isTudouHost) applyDetectedImageRequestMode('tudou-async');
         const rawJson = JSON.stringify(data.raw, null, 2);
         const probeMessage = String(data.message || '');
         const hideTasksEndpointTip = probeMessage.includes('/v1/tasks/');
@@ -3094,7 +3105,7 @@ async function testConnection(){
             if(detectedProtocol && detectedProtocol !== String(protocolInput?.value || '').toLowerCase()){
                 applyDetectedProtocol(detectedProtocol);
             }
-            if(data.image_request_mode) applyDetectedImageRequestMode(data.image_request_mode);
+            // 地址验证只检查连通性，不覆盖用户选择的图片协议。
             // 存入 picker 状态并启用「选择模型」按钮，但不自动弹出
             lastFetchedAll = data.all || [];
             lastFetchedSuggestion = {

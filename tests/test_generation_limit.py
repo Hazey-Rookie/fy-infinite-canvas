@@ -31,6 +31,7 @@ class ImageGenerationLimitTests(unittest.TestCase):
                     source = handle.read()
                 self.assertIn("const IMAGE_GENERATION_MAX = 3;", source)
                 self.assertNotIn("Math.min(8, Number(node.count", source)
+                self.assertNotIn("Math.min(8, Number(runSettings.count", source)
                 self.assertNotIn("[1,2,3,4,5,6,7,8]", source)
 
 

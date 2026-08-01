@@ -2,6 +2,15 @@
 
 本文件记录扶摇定制版的版本变化。官方上游版本继续由 `VERSION` 单独记录。
 
+## [Unreleased]
+
+### 上游兼容
+
+- 上游兼容基线更新到 `2026.08.01`，保留 FY 认证、角色权限和单次最多 3 张的生成限制。
+- 普通画布新增 APIMART Midjourney 节点及后续变体、扩图、平移和局部重绘操作。
+- 土豆 GPT-Image-2 切换到专用异步图片协议，并兼容 APIMART Markdown Data URL 图片响应。
+- Windows GPT CLI 安装器增加随包 GPT Image 2 helper 支持。
+
 ## [0.1.1] - 2026-07-29
 
 ### 优化

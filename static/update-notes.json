@@ -1,14 +1,22 @@
 {
-  "version": "2026.07.28.1",
-  "updated_at": "2026-07-29T00:00:00+08:00",
+  "version": "2026.08.01",
+  "updated_at": "2026-08-01T00:00:00+08:00",
   "items": [
     {
+      "type": "feature",
+      "text": "普通画布新增 Midjourney 节点，支持生成、融合、编辑及后续变体操作。"
+    },
+    {
       "type": "fix",
-      "text": "修复 APIMART Gemini 模型请求头不兼容导致的接口报错。"
+      "text": "兼容 APIMART Gemini 图片以 Markdown Data URL 返回的响应格式。"
+    },
+    {
+      "type": "feature",
+      "text": "土豆 GPT-Image-2 使用独立异步提交和任务轮询协议。"
     },
     {
       "type": "improvement",
-      "text": "优化画布高清图片懒加载，仅在缩放到可读范围且图片靠近视口时加载原图。"
+      "text": "Windows GPT CLI 安装器可优先使用随包提供的 GPT Image 2 helper。"
     }
   ]
 }

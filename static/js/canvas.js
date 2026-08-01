@@ -548,6 +548,17 @@ const SIZE_MAP = {
     ultrawide: { '1k':'1280x544', '2k':'2048x880', '4k':'3840x1648' },
     ultratall: { '1k':'544x1280', '2k':'880x2048', '4k':'1648x3840' }
 };
+const API_RATIO_VALUES = {
+    square:'1:1',
+    portrait:'2:3',
+    landscape:'3:2',
+    portrait43:'3:4',
+    landscape43:'4:3',
+    story:'9:16',
+    wide:'16:9',
+    ultrawide:'21:9',
+    ultratall:'9:21'
+};
 const RES_LONG_SIDE = { '1k':1536, '2k':2048, '4k':4096 };
 const RES_PIXEL_LIMIT = { '1k':1572864, '2k':4194304, '4k':16777216 };
 const CUSTOM_IMAGE_MODELS_KEY = 'canvas_custom_image_models';
@@ -685,6 +696,23 @@ function imageApiProviders(){
     const providers = (apiProviders.length ? apiProviders : defaultApiProviders())
         .filter(p => p.id !== 'modelscope' && p.enabled !== false && (p.image_models || []).length);
     return providers;
+}
+function midjourneyApiProviders(){
+    return (apiProviders.length ? apiProviders : [])
+        .filter(provider => provider.enabled !== false && (
+            String(provider.protocol || '').toLowerCase() === 'apimart'
+            || /(^|\.)apimart\.ai(?:\/|$)/i.test(String(provider.base_url || ''))
+        ));
+}
+function resolveMidjourneyProviderId(id){
+    const providers = midjourneyApiProviders();
+    return providers.find(provider => provider.id === id)?.id || providers[0]?.id || '';
+}
+function midjourneyProviderOptions(selectedId){
+    const selected = resolveMidjourneyProviderId(selectedId);
+    const providers = midjourneyApiProviders();
+    if(!providers.length) return '<option value="" disabled selected>请先配置 APIMart 平台</option>';
+    return providers.map(provider => `<option value="${escapeHtml(provider.id)}" ${provider.id === selected ? 'selected' : ''}>${escapeHtml(provider.name || provider.id)}</option>`).join('');
 }
 function providerById(id){
     return (apiProviders.length ? apiProviders : defaultApiProviders()).find(p => p.id === id) || imageApiProviders()[0] || defaultApiProviders()[0];
@@ -2579,6 +2607,14 @@ function addGeneratorNode(point){
     const model = allImageModels(providerId)[0] || '';
     return addNode({id:uid('gen'), type:'generator', x:p.x, y:p.y, apiProvider:providerId, model, ratio:'square', resolution:defaultApiImageResolution(model), customRatio:'', customSize:'', customRatioWidth:'', customRatioHeight:'', customWidth:'', customHeight:'', inputs:[]});
 }
+function addMidjourneyNode(point){
+    const p = point || defaultPoint(140, 0);
+    return addNode({
+        id:uid('mj'), type:'midjourney', x:p.x, y:p.y,
+        apiProvider:resolveMidjourneyProviderId(''), mode:'imagine', size:'1:1', version:'6.1', speed:'relax',
+        inputs:[], running:false, lastTaskId:'', lastAction:'', lastTaskStatus:'', lastImageCount:0, lastPrompt:'', mjModalTaskId:'', mjModalPrompt:''
+    });
+}
 function addMsGenNode(point){
     const p = point || defaultPoint(140, 0);
     return addNode({
@@ -3209,6 +3245,7 @@ function linkCreateOptions(state){
         if(['image','prompt','loop','group','promptGroup','llm','output'].includes(node.type)){
             return [
                 {type:'generator', label:tr('canvas.apiGenerate'), icon:'wand-sparkles'},
+                {type:'midjourney', label:'Midjourney', icon:'panel-top'},
                 {type:'msgen', label:tr('canvas.modelscopeGenerate'), icon:'cloud-lightning'},
                 {type:'comfy', label:tr('canvas.comfyGenerate'), icon:'workflow'},
                 {type:'rh', label:tr('canvas.rhGenerate'), icon:'workflow'},
@@ -3260,6 +3297,7 @@ function openGeneratorNodeMenu(nodeId, clientX, clientY){
         {type:'output', label:'Output', icon:'circle-dot'},
         ...(CANVAS_IMAGE_OUTPUT_TYPES.includes(node.type) ? [
             {type:'generator', label:tr('canvas.apiGenerate'), icon:'wand-sparkles'},
+            {type:'midjourney', label:'Midjourney', icon:'panel-top'},
             {type:'msgen', label:tr('canvas.modelscopeGenerate'), icon:'cloud-lightning'},
             {type:'comfy', label:tr('canvas.comfyGenerate'), icon:'workflow'},
             {type:'ltxDirector', label:tr('canvas.ltxDirector'), icon:'film'},
@@ -3583,6 +3621,7 @@ function createNodeByType(type, point){
     if(type === 'group') return addGroupNode(point);
     if(type === 'llm') return addLLMNode(point);
     if(type === 'generator') return addGeneratorNode(point);
+    if(type === 'midjourney') return addMidjourneyNode(point);
     if(type === 'msgen') return addMsGenNode(point);
     if(type === 'video') return addVideoNode(point);
     if(type === 'rh') return addRhNode(point);
@@ -3598,6 +3637,7 @@ function menuAdd(type){
     if(type === 'loop') addLoopNode(menuPoint);
     if(type === 'llm') addLLMNode(menuPoint);
     if(type === 'generator') addGeneratorNode(menuPoint);
+    if(type === 'midjourney') addMidjourneyNode(menuPoint);
     if(type === 'msgen') addMsGenNode(menuPoint);
     if(type === 'video') addVideoNode(menuPoint);
     if(type === 'rh') addRhNode(menuPoint);
@@ -6119,10 +6159,10 @@ function renderNode(node){
         if(node.type === 'output') openOutputNodeMenu(node.id, e.clientX, e.clientY);
         else openGeneratorNodeMenu(node.id, e.clientX, e.clientY);
     };
-    const title = node.type === 'image' ? 'Image' : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? 'Group' : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'rh' ? 'RunningHub' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'video' ? tr('canvas.videoGenerateNode') : tr('canvas.apiGenerate');
+    const title = node.type === 'image' ? 'Image' : node.type === 'prompt' ? 'Prompt' : node.type === 'loop' ? tr('canvas.loopNode') : node.type === 'promptGroup' ? 'Prompts' : node.type === 'group' ? 'Group' : node.type === 'output' ? 'Output' : node.type === 'llm' ? 'LLM' : node.type === 'comfy' ? 'ComfyUI' : node.type === 'ltxDirector' ? tr('canvas.ltxDirector') : node.type === 'rh' ? 'RunningHub' : node.type === 'midjourney' ? 'Midjourney' : node.type === 'msgen' ? tr('canvas.modelscopeGenerate') : node.type === 'video' ? tr('canvas.videoGenerateNode') : tr('canvas.apiGenerate');
     const displayTitle = node.type === 'image' && node.url ? nodeTitleForMedia(node) : title;
     // 失败徽章只在一键运行模式中显示，单节点失败已通过 alert 提示
-    const showStatus = ['generator','msgen','comfy','ltxDirector','llm','video','rh'].includes(node.type) && node.runStatus
+    const showStatus = ['generator','midjourney','msgen','comfy','ltxDirector','llm','video','rh'].includes(node.type) && node.runStatus
         && (node.runStatus !== 'failed' || node._cascadeFailed);
     const statusHtml = showStatus ? (() => {
         const label = { queued:'排队中', running:'运行中', done:'完成', failed:'失败' }[node.runStatus] || '';
@@ -6274,6 +6314,7 @@ function renderNode(node){
     }
     if(node.type === 'llm') body.appendChild(renderLLMBody(node));
     if(node.type === 'generator') body.appendChild(renderGeneratorBody(node));
+    if(node.type === 'midjourney') body.appendChild(renderMidjourneyBody(node));
     if(node.type === 'msgen') body.appendChild(renderMsGenBody(node));
     if(node.type === 'video') body.appendChild(renderVideoBody(node));
     if(node.type === 'rh') body.appendChild(renderRhBody(node));
@@ -6298,8 +6339,8 @@ function renderNode(node){
         if(e.button !== 0 || !isNodeDragSurface(e.target)) return;
         startNodeDrag(e, node);
     };
-    const canInput = ['generator','comfy','ltxDirector','output','llm','msgen','video','rh'].includes(node.type) || (node.type === 'loop' && (node.imageInput || node.showPrompt));
-    const canOutput = ['image','prompt','loop','group','promptGroup','generator','comfy','ltxDirector','llm','msgen','video','rh','output'].includes(node.type);
+    const canInput = ['generator','midjourney','comfy','ltxDirector','output','llm','msgen','video','rh'].includes(node.type) || (node.type === 'loop' && (node.imageInput || node.showPrompt));
+    const canOutput = ['image','prompt','loop','group','promptGroup','generator','midjourney','comfy','ltxDirector','llm','msgen','video','rh','output'].includes(node.type);
     if(canInput) el.insertAdjacentHTML('beforeend', `<div class="port in" title="${tr('canvas.connectHere')}"></div>`);
     if(canOutput) el.insertAdjacentHTML('beforeend', `<div class="port out" title="${tr('canvas.dragConnect')}"></div>`);
     el.insertAdjacentHTML('beforeend', `<div class="resize-handle" title="${tr('canvas.resize')}"></div>`);
@@ -6469,6 +6510,7 @@ function defaultNodeSize(type){
     if(type === 'loop') return {w:336, h:0};
     if(type === 'llm') return {w:420, h:590};
     if(type === 'generator') return {w:380, h:0};
+    if(type === 'midjourney') return {w:380, h:0};
     if(type === 'msgen') return {w:380, h:0};
     if(type === 'video') return {w:400, h:0};
     if(type === 'rh') return {w:430, h:0};
@@ -8562,6 +8604,100 @@ function renderGeneratorBody(node){
     bindCascadeButtons(wrap, node.id);
     return wrap;
 }
+function midjourneyModalHtml(node, maskRef){
+    if(!node.mjModalTaskId) return '';
+    const hasMask = Boolean(maskRef?.url);
+    return `<div class="mj-modal-panel"><div class="mj-action-title">局部重绘</div><textarea class="mj-modal-prompt" placeholder="描述要替换的内容">${escapeHtml(node.mjModalPrompt || node.lastPrompt || '')}</textarea><div class="mj-modal-mask ${hasMask ? 'ready' : ''}"><i data-lucide="${hasMask ? 'brush' : 'image-off'}"></i><span>${hasMask ? `遮罩已连接：${escapeHtml(maskRef.name || 'mask')}` : '连接遮罩图片节点后才能提交'}</span></div><button type="button" class="mj-reroll mj-modal-submit" ${hasMask && !node.running ? '' : 'disabled'}><i data-lucide="wand-sparkles"></i>${node.running ? '提交中...' : '提交局部重绘'}</button></div>`;
+}
+function midjourneyContinuationHtml(node){
+    if(!node.lastTaskId || node.mjModalTaskId) return '';
+    if(['blend','edit'].includes(node.lastAction)) return '';
+    const isSingle = Number(node.lastImageCount || 0) === 1;
+    if(!isSingle){
+        if(['8.1','8.2'].includes(String(node.version || '')) && node.lastAction !== 'blend' && node.lastAction !== 'edit'){
+            return `<div class="mj-actions"><div class="mj-action-title">v8 重塑</div><div class="mj-action-grid">${[1,2,3,4].map(index => `<button type="button" data-mj-action="remix_subtle" data-index="${index}" title="轻微重塑第 ${index} 张">R${index}</button>`).join('')}</div><div class="mj-action-grid">${[1,2,3,4].map(index => `<button type="button" data-mj-action="remix_strong" data-index="${index}" title="强烈重塑第 ${index} 张">R+${index}</button>`).join('')}</div><button class="mj-reroll" type="button" data-mj-action="reroll"><i data-lucide="refresh-cw"></i>重新生成</button></div>`;
+        }
+        return `<div class="mj-actions"><div class="mj-action-title">选择四宫格图片</div><div class="mj-action-grid">${[1,2,3,4].map(index => `<button type="button" data-mj-action="upscale" data-index="${index}" title="放大第 ${index} 张">U${index}</button>`).join('')}</div><div class="mj-action-grid">${[1,2,3,4].map(index => `<button type="button" data-mj-action="variation" data-index="${index}" title="生成第 ${index} 张的弱变体">V${index}</button>`).join('')}</div><button class="mj-reroll" type="button" data-mj-action="reroll"><i data-lucide="refresh-cw"></i>重新生成</button></div>`;
+    }
+    return `<div class="mj-actions"><div class="mj-action-title">单图细化</div><div class="mj-text-action-grid"><button type="button" data-mj-action="low_variation" data-index="1">弱变体</button><button type="button" data-mj-action="high_variation" data-index="1">强变体</button><button type="button" data-mj-action="zoom" data-zoom-ratio="1.5">扩图 1.5x</button><button type="button" data-mj-action="zoom" data-zoom-ratio="2">扩图 2x</button></div><div class="mj-pan-grid"><button type="button" data-mj-action="pan" data-direction="left" title="向左扩展"><i data-lucide="arrow-left"></i></button><button type="button" data-mj-action="pan" data-direction="up" title="向上扩展"><i data-lucide="arrow-up"></i></button><button type="button" data-mj-action="inpaint" title="局部重绘"><i data-lucide="brush"></i></button><button type="button" data-mj-action="pan" data-direction="right" title="向右扩展"><i data-lucide="arrow-right"></i></button></div></div>`;
+}
+function renderMidjourneyBody(node){
+    const wrap = document.createElement('div');
+    wrap.className = 'generator-body midjourney-body';
+    node.apiProvider = resolveMidjourneyProviderId(node.apiProvider || '');
+    node.mode = ['imagine','blend','edit'].includes(node.mode) ? node.mode : 'imagine';
+    node.size = /^\d{1,2}:\d{1,2}$/.test(String(node.size || '')) ? node.size : '1:1';
+    node.version = String(node.version || '6.1');
+    node.speed = ['relax','fast','turbo'].includes(node.speed) ? node.speed : 'relax';
+    const sources = orderedSources(node, generatorSources(node));
+    const mediaInputs = sources.filter(src => src.refs?.some(ref => mediaKindForRef(ref) === 'image'));
+    const promptInputs = sources.filter(src => src.prompt && !src.refs?.length);
+    const maskRef = mediaInputs.flatMap(source => source.refs || []).find(ref => String(ref.role || '').toLowerCase() === 'mask') || null;
+    const hasProvider = Boolean(node.apiProvider);
+    const taskText = node.lastTaskId ? `任务 ${escapeHtml(node.lastTaskId.slice(-14))}` : '生成四宫格后可选图';
+    const runLabel = node.running ? '提交中...' : '生成四宫格';
+    wrap.innerHTML = `
+        <div class="prompt-list mb-3"></div>
+        <div class="midjourney-input-head"><span>参考图片</span><span>最多 4 张</span></div>
+        <div class="input-list mj-input-list"></div>
+        <div class="gen-settings mj-settings">
+            <div class="gen-settings-row">
+                <select class="select-lite mj-mode"><option value="imagine" ${node.mode === 'imagine' ? 'selected' : ''}>生成</option><option value="blend" ${node.mode === 'blend' ? 'selected' : ''}>融合</option><option value="edit" ${node.mode === 'edit' ? 'selected' : ''}>编辑</option></select>
+                <select class="select-lite mj-provider">${midjourneyProviderOptions(node.apiProvider)}</select>
+                <select class="select-lite mj-version">
+                    ${['8.2','8.1','7','6.1','5.2','5.1'].map(version => `<option value="${version}" ${node.version === version ? 'selected' : ''}>v${version}</option>`).join('')}
+                </select>
+            </div>
+            <div class="gen-settings-row">
+                <select class="select-lite mj-size">
+                    ${['1:1','3:4','4:3','9:16','16:9','21:9'].map(size => `<option value="${size}" ${node.size === size ? 'selected' : ''}>${size}</option>`).join('')}
+                </select>
+                <select class="select-lite mj-speed">
+                    <option value="relax" ${node.speed === 'relax' ? 'selected' : ''}>Relax</option>
+                    <option value="fast" ${node.speed === 'fast' ? 'selected' : ''}>Fast</option>
+                    <option value="turbo" ${node.speed === 'turbo' ? 'selected' : ''}>Turbo</option>
+                </select>
+            </div>
+        </div>
+        <div class="mj-task-line ${node.lastTaskId ? 'ready' : ''}"><i data-lucide="clock-3"></i><span>${taskText}</span></div>
+        <div class="gen-run-row"><button class="gen-btn mj-run" ${node.running || !hasProvider ? 'disabled' : ''}><i data-lucide="wand-sparkles" class="w-4 h-4"></i>${runLabel}</button>${cascadeBtnHtml(node)}</div>
+        ${midjourneyContinuationHtml(node)}
+        ${midjourneyModalHtml(node, maskRef)}
+        ${retryBarHtml(node)}
+    `;
+    renderPromptPreview(wrap.querySelector('.prompt-list'), promptInputs);
+    renderImageInputList(wrap.querySelector('.mj-input-list'), node, mediaInputs);
+    ['mode','provider','version','size','speed'].forEach(field => {
+        const input = wrap.querySelector(`.mj-${field}`);
+        if(!input) return;
+        input.onchange = event => {
+            event.stopPropagation();
+            node[field === 'provider' ? 'apiProvider' : field] = event.target.value;
+            scheduleSave();
+            if(field === 'provider' || field === 'mode') render();
+        };
+    });
+    wrap.querySelector('.mj-run').onclick = event => { event.stopPropagation(); runCanvasGenerate(node.id); };
+    wrap.querySelectorAll('[data-mj-action]').forEach(button => {
+        button.onclick = event => {
+            event.stopPropagation();
+            runMidjourneyAction(node.id, button.dataset.mjAction, Number(button.dataset.index || 0), {
+                direction:button.dataset.direction || '',
+                zoomRatio:Number(button.dataset.zoomRatio || 0) || null
+            });
+        };
+    });
+    const modalPrompt = wrap.querySelector('.mj-modal-prompt');
+    if(modalPrompt){
+        modalPrompt.oninput = event => { node.mjModalPrompt = event.target.value; scheduleSave(); };
+    }
+    const modalSubmit = wrap.querySelector('.mj-modal-submit');
+    if(modalSubmit){
+        modalSubmit.onclick = event => { event.stopPropagation(); runMidjourneyModal(node.id, maskRef); };
+    }
+    bindCascadeButtons(wrap, node.id);
+    return wrap;
+}
 function renderVideoBody(node){
     const wrap = document.createElement('div');
     wrap.className = 'generator-body';
@@ -10210,9 +10346,9 @@ function updateComfyField(node, input, event){
     scheduleSave();
 }
 
-const CANVAS_GENERATOR_TYPES = ['generator','msgen','comfy','ltxDirector','video','rh'];
-const CANVAS_IMAGE_OUTPUT_TYPES = ['generator','msgen','comfy','ltxDirector','rh'];
-const CANVAS_MEDIA_OUTPUT_TYPES = ['generator','msgen','comfy','ltxDirector','video','rh'];
+const CANVAS_GENERATOR_TYPES = ['generator','midjourney','msgen','comfy','ltxDirector','video','rh'];
+const CANVAS_IMAGE_OUTPUT_TYPES = ['generator','midjourney','msgen','comfy','ltxDirector','rh'];
+const CANVAS_MEDIA_OUTPUT_TYPES = ['generator','midjourney','msgen','comfy','ltxDirector','video','rh'];
 function hasExplicitOutputConnection(nodeId){
     return connections.some(c => {
         if(c.from !== nodeId) return false;
@@ -10455,6 +10591,7 @@ function refreshGeneratorInputViews(){
             .filter(src => src.refs?.length);
         renderPromptPreview(el.querySelector('.prompt-list'), sources.filter(src => src.prompt && !src.refs?.length));
         if(gen.type === 'generator') renderImageInputList(el.querySelector('.input-list'), gen, imageInputs);
+        if(gen.type === 'midjourney') renderImageInputList(el.querySelector('.mj-input-list'), gen, imageInputs);
         if(gen.type === 'msgen') renderImageInputList(el.querySelector('.ms-img-list'), gen, imageInputs);
         if(gen.type === 'comfy') renderComfyImages(el.querySelector('.input-list'), gen, imageInputs);
         if(gen.type === 'ltxDirector'){
@@ -10560,6 +10697,164 @@ async function runGenerator(genId, opts={}){
         showErrorModal(err.message || tr('canvas.generationFailed'), tr('canvas.apiFailed'));
     }
 }
+async function midjourneyRequest(path, options={}){
+    const {cascadeTargetId='', ...init} = options;
+    const response = await cascadeFetch(path, init, cascadeTargetId ? {cascadeTargetId} : {});
+    if(!response.ok) throw new Error(await responseErrorMessage(response, 'Midjourney 请求失败'));
+    return response.json();
+}
+async function waitMidjourneyTask(providerId, taskId, options={}){
+    while(true){
+        const cascadeTargetId = cascadeTargetIdFromOptions(options);
+        if(cascadeTargetId) ensureCascadeActive(cascadeTargetId);
+        const result = await midjourneyRequest(`/api/midjourney/tasks/${encodeURIComponent(taskId)}?provider_id=${encodeURIComponent(providerId)}`, {cascadeTargetId});
+        if(result.status === 'succeeded') return result;
+        if(result.status === 'failed') throw new Error(result.error || 'Midjourney 任务失败');
+        await sleep(2200);
+    }
+}
+async function completeMidjourneyRun(node, out, run, result, append=false){
+    const outputs = result.image_items?.length ? result.image_items : (result.images || []);
+    if(!outputs.length) throw new Error('Midjourney 任务没有返回图片');
+    run.request = requestMetaFromResult(result);
+    run.request.task_id = result.task_id || node.lastTaskId || '';
+    appendOutputImages(out, outputs, run.refs?.[0], [{runMs:nowMs() - Number(run.startedAt || nowMs()), run}]);
+    mergeGeneratedOutputs(node, outputs, append);
+    node.runStatus = 'done';
+    node.runError = '';
+    node.running = false;
+    node.lastTaskStatus = 'SUCCESS';
+    node.lastImageCount = outputs.length;
+    addGenerationLog({run, outputs, runMs:nowMs() - Number(run.startedAt || nowMs())});
+    refreshRunNodes(node, out);
+    scheduleSave();
+}
+async function runMidjourneyNode(nodeId, opts={}){
+    const node = nodes.find(item => item.id === nodeId);
+    if(!node || (node.running && !opts.cascade)) return;
+    const providerId = resolveMidjourneyProviderId(node.apiProvider || '');
+    if(!providerId){ showErrorModal('请先在 API 设置中添加 APIMart 平台。', 'Midjourney'); return; }
+    const sources = orderedSources(node, generatorSources(node));
+    const prompt = sources.map(source => source.prompt).filter(Boolean).join('\n\n').trim();
+    const refs = imageRefsOnly(sources.flatMap(source => source.refs || []));
+    const mode = ['imagine','blend','edit'].includes(node.mode) ? node.mode : 'imagine';
+    if(mode === 'blend' && (refs.length < 2 || refs.length > 4)){
+        alert('多图融合需要连接 2 到 4 张图片');
+        return;
+    }
+    if(mode !== 'blend' && !prompt){ alert(tr('canvas.needPrompt')); return; }
+    if(mode === 'edit' && !refs.length){ alert('图片编辑需要连接至少一张图片'); return; }
+    const out = outputForNode(node, 460);
+    const run = runSnapshot(node, prompt, refs);
+    run.taskLabel = mode === 'blend' ? 'Midjourney 多图融合' : mode === 'edit' ? 'Midjourney 图片编辑' : `Midjourney v${node.version || '6.1'}`;
+    run.startedAt = nowMs();
+    node.lastPrompt = prompt;
+    node.running = true;
+    node.runStatus = 'running';
+    node.runError = '';
+    refreshRunNodes(node, out);
+    try {
+        const submitted = await midjourneyRequest('/api/midjourney/submit', {
+            method:'POST', headers:{'Content-Type':'application/json'}, cascadeTargetId:cascadeTargetIdFromOptions(opts),
+            body:JSON.stringify({provider_id:providerId, mode, prompt, size:node.size, version:node.version, speed:node.speed, reference_images:refs.slice(0, 4)})
+        });
+        node.lastTaskId = submitted.task_id;
+        node.lastAction = mode;
+        node.lastTaskStatus = submitted.status || 'queued';
+        scheduleSave();
+        const result = await waitMidjourneyTask(providerId, submitted.task_id, opts);
+        await completeMidjourneyRun(node, out, run, result, Boolean(opts.cascade));
+    } catch(error) {
+        node.running = false;
+        node.runStatus = 'failed';
+        node.runError = error.message || String(error);
+        node.lastTaskStatus = 'FAILED';
+        addGenerationLog({run, outputs:[], runMs:nowMs() - run.startedAt, error:node.runError});
+        refreshRunNodes(node, out);
+        scheduleSave();
+        if(opts.cascade) throw error;
+        showErrorModal(node.runError, 'Midjourney');
+    }
+}
+async function runMidjourneyAction(nodeId, action, index=0, extra={}){
+    const node = nodes.find(item => item.id === nodeId);
+    if(!node?.lastTaskId || node.running) return;
+    const providerId = resolveMidjourneyProviderId(node.apiProvider || '');
+    if(!providerId){ showErrorModal('请先在 API 设置中添加 APIMart 平台。', 'Midjourney'); return; }
+    const out = outputForNode(node, 460);
+    const run = runSnapshot(node, '', []);
+    const actionLabels = {upscale:`U${index}`, variation:`V${index}`, low_variation:'弱变体', high_variation:'强变体', remix_subtle:`轻微重塑 ${index}`, remix_strong:`强烈重塑 ${index}`, zoom:`扩图 ${extra.zoomRatio || 2}x`, pan:`平移 ${extra.direction || ''}`, inpaint:'局部重绘', reroll:'Reroll'};
+    run.taskLabel = `Midjourney ${actionLabels[action] || action}`;
+    run.startedAt = nowMs();
+    node.running = true;
+    node.runStatus = 'running';
+    refreshRunNodes(node, out);
+    try {
+        const submitted = await midjourneyRequest('/api/midjourney/actions', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({provider_id:providerId, task_id:node.lastTaskId, action, index, speed:node.speed, prompt:node.lastPrompt || '', direction:extra.direction || '', zoom_ratio:extra.zoomRatio || null})
+        });
+        node.lastTaskId = submitted.task_id;
+        node.lastAction = action;
+        node.lastTaskStatus = submitted.status || 'queued';
+        scheduleSave();
+        if(action === 'inpaint'){
+            node.mjModalTaskId = submitted.task_id;
+            node.mjModalPrompt = node.mjModalPrompt || node.lastPrompt || '';
+            node.running = false;
+            node.runStatus = '';
+            refreshRunNodes(node, out);
+            scheduleSave();
+            return;
+        }
+        const result = await waitMidjourneyTask(providerId, submitted.task_id);
+        await completeMidjourneyRun(node, out, run, result, true);
+    } catch(error) {
+        node.running = false;
+        node.runStatus = 'failed';
+        node.runError = error.message || String(error);
+        node.lastTaskStatus = 'FAILED';
+        addGenerationLog({run, outputs:[], runMs:nowMs() - run.startedAt, error:node.runError});
+        refreshRunNodes(node, out);
+        scheduleSave();
+        showErrorModal(node.runError, 'Midjourney');
+    }
+}
+async function runMidjourneyModal(nodeId, maskRef){
+    const node = nodes.find(item => item.id === nodeId);
+    if(!node?.mjModalTaskId || !maskRef?.url || node.running) return;
+    const providerId = resolveMidjourneyProviderId(node.apiProvider || '');
+    if(!providerId){ showErrorModal('请先在 API 设置中添加 APIMart 平台。', 'Midjourney'); return; }
+    const out = outputForNode(node, 460);
+    const prompt = String(node.mjModalPrompt || node.lastPrompt || '').trim();
+    const run = runSnapshot(node, prompt, [maskRef]);
+    run.taskLabel = 'Midjourney 局部重绘';
+    run.startedAt = nowMs();
+    node.running = true;
+    node.runStatus = 'running';
+    refreshRunNodes(node, out);
+    try {
+        const submitted = await midjourneyRequest('/api/midjourney/modal', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({provider_id:providerId, task_id:node.mjModalTaskId, prompt, speed:node.speed, mask_image:maskRef})
+        });
+        node.lastTaskId = submitted.task_id;
+        node.lastAction = 'inpaint';
+        node.lastTaskStatus = submitted.status || 'submitted';
+        node.mjModalTaskId = '';
+        scheduleSave();
+        const result = await waitMidjourneyTask(providerId, submitted.task_id);
+        await completeMidjourneyRun(node, out, run, result, true);
+    } catch(error) {
+        node.running = false;
+        node.runStatus = 'failed';
+        node.runError = error.message || String(error);
+        addGenerationLog({run, outputs:[], runMs:nowMs() - run.startedAt, error:node.runError});
+        refreshRunNodes(node, out);
+        scheduleSave();
+        showErrorModal(node.runError, 'Midjourney');
+    }
+}
 async function runGeneratorLegacy(genId, opts={}){
     const gen = nodes.find(n => n.id === genId);
     if(!gen || (gen.running && !opts.cascade)) return;
@@ -10585,6 +10880,8 @@ async function runGeneratorLegacy(genId, opts={}){
             provider_id:resolveImageProviderId(gen.apiProvider || 'comfly'),
             model:resolveImageModel(gen.model),
             size:requestSize,
+            aspect_ratio:API_RATIO_VALUES[gen.ratio] || (gen.ratio === 'custom' ? String(gen.customRatio || '').trim() : ''),
+            resolution:['1k','2k','4k'].includes(gen.resolution) ? gen.resolution : '',
             reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
         };
         const quality = normalizedImageQuality(gen.quality);
@@ -11638,6 +11935,7 @@ function bindCascadeButtons(wrap, nodeId){
 function runCascadeNodeByType(node, opts={}){
     const runOpts = {cascade:true, ...opts};
     if(node.type === 'generator') return runGenerator(node.id, runOpts);
+    if(node.type === 'midjourney') return runMidjourneyNode(node.id, runOpts);
     if(node.type === 'msgen') return runMsGenNode(node.id, runOpts);
     if(node.type === 'comfy') return runComfyNode(node.id, runOpts);
     if(node.type === 'ltxDirector') return runLTXDirectorNode(node.id, runOpts);
@@ -11677,7 +11975,7 @@ async function runLimitedCascadeRounds(rounds, limit, runner){
     return Promise.allSettled(workers);
 }
 function canvasRunTypes(){
-    return ['generator','msgen','comfy','ltxDirector','llm','video','rh'];
+    return ['generator','midjourney','msgen','comfy','ltxDirector','llm','video','rh'];
 }
 function canvasWorkflowEdges(){
     const runTypes = canvasRunTypes();
@@ -11916,6 +12214,7 @@ async function runOneCascadePass(order, options={}){
         refreshNodes([id]);
         try {
             if(node.type === 'generator') await runGenerator(id, {cascade:true, cascadeTargetId:targetId});
+            else if(node.type === 'midjourney') await runMidjourneyNode(id, {cascade:true, cascadeTargetId:targetId});
             else if(node.type === 'msgen') await runMsGenNode(id, {cascade:true, cascadeTargetId:targetId});
             else if(node.type === 'comfy') await runComfyNode(id, {cascade:true, cascadeTargetId:targetId});
             else if(node.type === 'ltxDirector') await runLTXDirectorNode(id, {cascade:true, cascadeTargetId:targetId});
