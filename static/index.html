@@ -1753,16 +1753,16 @@
                         </svg>
                         <span class="side-pill-text" data-i18n="common.comfyuiSettings">工作流设置</span>
                     </button>
-                    <button class="side-pill" data-permission="menu:organization-permissions" hidden onclick="switchUI(this, 'org-permissions')" type="button" title="组织与权限">
-                        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                            <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path>
-                            <circle cx="9" cy="7" r="4"></circle>
-                            <path d="M22 21v-2a4 4 0 0 0-3-3.87"></path>
-                            <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
-                        </svg>
-                        <span class="side-pill-text">组织与权限</span>
-                    </button>
                 </div>
+                <button class="side-pill" data-permission="menu:organization-permissions" hidden onclick="switchUI(this, 'org-permissions')" type="button" title="组织与权限">
+                    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                        <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path>
+                        <circle cx="9" cy="7" r="4"></circle>
+                        <path d="M22 21v-2a4 4 0 0 0-3-3.87"></path>
+                        <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                    </svg>
+                    <span class="side-pill-text">组织与权限</span>
+                </button>
                 <div class="sidebar-user-card" id="sidebar-user-card" title="当前登录用户">
                     <div class="sidebar-user-avatar" aria-hidden="true">
                         <img id="sidebar-user-avatar" alt="" hidden>
@@ -1805,18 +1805,18 @@
         </script>
 
         <main class="stage">
-            <iframe id="frame-zimage" data-src="/static/zimage.html?v=2026.08.01.1785274871" class="active" scrolling="yes"></iframe>
-            <iframe id="frame-enhance" data-src="/static/enhance.html?v=2026.08.01.1785591091" scrolling="yes"></iframe>
-            <iframe id="frame-klein" data-src="/static/klein.html?v=2026.08.01.1785274871" scrolling="yes"></iframe>
-            <iframe id="frame-angle" data-src="/static/angle.html?v=2026.08.01.1785591091" scrolling="yes"></iframe>
+            <iframe id="frame-zimage" data-src="/static/zimage.html?v=2026.08.01.1785609116" class="active" scrolling="yes"></iframe>
+            <iframe id="frame-enhance" data-src="/static/enhance.html?v=2026.08.01.1785609116" scrolling="yes"></iframe>
+            <iframe id="frame-klein" data-src="/static/klein.html?v=2026.08.01.1785609116" scrolling="yes"></iframe>
+            <iframe id="frame-angle" data-src="/static/angle.html?v=2026.08.01.1785609116" scrolling="yes"></iframe>
             <iframe id="frame-miao-nav" data-src="http://dh.iiicg.com/" scrolling="yes" referrerpolicy="no-referrer" title="画忆的妙妙屋导航"></iframe>
-            <iframe id="frame-online" data-src="/static/online.html?v=2026.08.01.1785274871" scrolling="yes"></iframe>
-            <iframe id="frame-gpt-chat" data-src="/static/gpt-chat.html?v=2026.08.01.1785591091" scrolling="yes"></iframe>
+            <iframe id="frame-online" data-src="/static/online.html?v=2026.08.01.1785609116" scrolling="yes"></iframe>
+            <iframe id="frame-gpt-chat" data-src="/static/gpt-chat.html?v=2026.08.01.1785609116" scrolling="yes"></iframe>
             <iframe id="frame-asset-manager" data-src="/static/asset-manager.html?v=2026.08.01.1785591091" scrolling="yes"></iframe>
-            <iframe id="frame-api-settings" data-src="/static/api-settings.html?v=2026.08.01.1785591091" scrolling="yes"></iframe>
-            <iframe id="frame-comfyui-settings" data-src="/static/comfyui-settings.html?v=2026.08.01.1785591091" scrolling="yes"></iframe>
-                <iframe id="frame-org-permissions" data-src="/static/org-permissions.html?v=2026.08.01.1785274871" scrolling="yes"></iframe>
-            <iframe id="frame-canvas" data-src="/static/canvas-list.html?v=2026.08.01.1785591091" scrolling="yes"></iframe>
+            <iframe id="frame-api-settings" data-src="/static/api-settings.html?v=2026.08.01.1785609116" scrolling="yes"></iframe>
+            <iframe id="frame-comfyui-settings" data-src="/static/comfyui-settings.html?v=2026.08.01.1785609116" scrolling="yes"></iframe>
+                <iframe id="frame-org-permissions" data-src="/static/org-permissions.html?v=2026.08.01.1785695481" scrolling="yes"></iframe>
+            <iframe id="frame-canvas" data-src="/static/canvas-list.html?v=2026.08.01.1785609116" scrolling="yes"></iframe>
 
         </main>
     </div>
@@ -1944,13 +1944,17 @@
         let projectUpdateReadOnly = false;
         let appInfoPromise = null;
         let updateCheckScheduled = false;
+        let accessProfileRefreshPromise = null;
 
         function isProjectUpdateAdmin() {
             return accessProfile?.user?.is_super_admin === true;
         }
 
         function hasPermission(permission) {
-            return !permission || Boolean(accessProfile?.user?.is_super_admin) || (accessProfile?.user?.permissions || []).includes(permission);
+            const user = accessProfile?.user || {};
+            if(!permission || user.is_super_admin) return true;
+            if(permission === 'menu:organization-permissions' && user.is_tenant_admin) return true;
+            return (user.permissions || []).includes(permission);
         }
 
         function canAccessPage(id) {
@@ -1975,8 +1979,9 @@
             const user = accessProfile?.user || {};
             const userName = user.name || '当前用户';
             const departments = Array.isArray(user.department_names) ? user.department_names.filter(Boolean) : [];
-            const roleLabel = user.is_super_admin ? 'ADMIN' : String(user.role || '').toUpperCase();
-            const metaLabel = [departments.join('、'), roleLabel].filter(Boolean).join(' · ') || '已登录';
+            const roleLabel = user.is_super_admin ? 'ADMIN' : (user.is_tenant_admin ? '企业管理员' : String(user.role || '').toUpperCase());
+            const tenantName = String(accessProfile?.tenant?.name || user.tenant_key || '').trim();
+            const metaLabel = [tenantName, departments.join('、'), roleLabel].filter(Boolean).join(' · ') || '已登录';
             const avatarUrl = String(user.avatar_url || '').trim();
             const avatar = document.getElementById('sidebar-user-avatar');
             const initial = document.getElementById('sidebar-user-initial');
@@ -1994,7 +1999,7 @@
             if(initial) initial.hidden = Boolean(avatarUrl);
         }
 
-        async function loadAccessProfile() {
+        async function loadAccessProfile(options = {}) {
             try {
                 const response = await fetch('/api/auth/me', {cache:'no-store'});
                 if(response.status === 401) {
@@ -2004,13 +2009,31 @@
                 if(!response.ok) throw new Error(`HTTP ${response.status}`);
                 accessProfile = await response.json();
                 applyAccessProfile();
+                if(options.reconcileActivePage) {
+                    document.querySelectorAll('iframe[src]').forEach(frame => syncAuthToFrame(frame));
+                    const currentId = String(activeFrame()?.id || '').replace(/^frame-/, '');
+                    if(currentId && !canAccessPage(currentId)) {
+                        const trigger = document.querySelector(`[onclick*="'${DEFAULT_PAGE_ID}'"],[onclick*='"${DEFAULT_PAGE_ID}"']`);
+                        switchUI(trigger, DEFAULT_PAGE_ID);
+                    }
+                }
                 return true;
             } catch(error) {
-                accessProfile = {user:{permissions:[],read_only:true}};
-                applyAccessProfile();
+                if(!options.preserveExisting || !accessProfile) {
+                    accessProfile = {user:{permissions:[],read_only:true}};
+                    applyAccessProfile();
+                }
                 console.error('权限信息加载失败', error);
-                return true;
+                return Boolean(accessProfile);
             }
+        }
+
+        function refreshAccessProfile() {
+            if(document.hidden) return Promise.resolve(false);
+            if(accessProfileRefreshPromise) return accessProfileRefreshPromise;
+            accessProfileRefreshPromise = loadAccessProfile({preserveExisting:true,reconcileActivePage:true})
+                .finally(() => { accessProfileRefreshPromise = null; });
+            return accessProfileRefreshPromise;
         }
 
         async function logoutStudio() {
@@ -2201,6 +2224,9 @@
             document.documentElement.classList.remove('studio-route-booting');
         }
         document.addEventListener('DOMContentLoaded', restoreActivePage, { once:true });
+        document.addEventListener('visibilitychange', () => { if(!document.hidden) refreshAccessProfile(); });
+        window.addEventListener('focus', refreshAccessProfile);
+        window.setInterval(refreshAccessProfile, 15000);
 
         async function syncStatus() {
             try {

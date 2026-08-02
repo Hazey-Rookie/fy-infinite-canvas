@@ -19,7 +19,7 @@ RUN npm install --global \
 
 FROM python:3.12-slim
 
-ARG FY_VERSION=0.1.1
+ARG FY_VERSION=0.2.0
 ARG VCS_REF=unknown
 
 LABEL org.opencontainers.image.title="fy-infinite-canvas" \

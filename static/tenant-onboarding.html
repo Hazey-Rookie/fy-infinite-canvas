@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>企业接入</title>
+    <style>
+        :root{color-scheme:light;--bg:#f5f7fa;--surface:#fff;--text:#17202b;--muted:#68707d;--line:#dfe4eb;--accent:#246bfd;--danger:#b42318}
+        *{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font-family:Inter,"Microsoft YaHei",sans-serif}main{width:min(620px,calc(100vw - 32px));margin:8vh auto;padding:28px;border:1px solid var(--line);border-radius:8px;background:var(--surface);box-shadow:0 16px 50px rgba(17,31,49,.08)}h1{margin:0;font-size:24px}p{color:var(--muted);font-size:13px;line-height:1.6}.field{display:grid;gap:6px;margin-top:16px;color:var(--muted);font-size:12px;font-weight:700}.field input{min-height:40px;padding:0 10px;border:1px solid var(--line);border-radius:5px;font:inherit;color:var(--text)}.field-help{margin-top:-1px;color:var(--muted);font-size:11px;font-weight:400;line-height:1.4}button{min-height:40px;padding:0 14px;border:0;border-radius:5px;background:var(--text);color:#fff;font:inherit;font-weight:700;cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}.submit{width:100%;margin-top:20px}.notice{margin-top:14px;padding:10px 12px;border-radius:5px;background:#fff5e8;color:#875000;font-size:13px;line-height:1.5}.notice.error{background:#fff0ee;color:var(--danger)}.success{margin-top:18px;padding:14px;border:1px solid #b8dfc5;border-radius:5px;background:#f1fbf4;color:#1c6d3d}.success a{display:inline-block;margin-top:8px;color:#145cde;word-break:break-all}
+    </style>
+</head>
+<body>
+<main>
+    <h1>企业接入扶摇 AI Studio</h1>
+    <p id="intro">正在验证邀请链接...</p>
+    <form id="form" hidden>
+        <label class="field">企业标识<input id="tenantKey" required maxlength="64" pattern="[a-z0-9][a-z0-9_-]{0,63}" placeholder="例如：acme"><small class="field-help">用于系统识别企业，不是企业显示名称；仅支持小写字母、数字、下划线和连字符，首字符须为字母或数字。</small></label>
+        <label class="field">飞书 App ID<input id="appId" required maxlength="120" placeholder="cli_xxx"></label>
+        <label class="field">飞书 App Secret<input id="appSecret" required maxlength="240" type="password"></label>
+        <label class="field">OAuth 回调地址<input id="redirectUri" required placeholder="当前访问地址/auth/callback"></label>
+        <button class="submit" id="submit" type="submit">验证并完成企业接入</button>
+    </form>
+    <div id="notice" class="notice" hidden></div>
+    <div id="success" class="success" hidden></div>
+</main>
+<script>
+const token=new URLSearchParams(location.search).get('token')||'';const $=id=>document.getElementById(id);let invitation=null;$('redirectUri').value=`${location.origin}/auth/callback`;
+function message(text,error=false){$('notice').textContent=text;$('notice').className=`notice${error?' error':''}`;$('notice').hidden=!text;}
+async function api(url,options={}){const response=await fetch(url,{...options,headers:{'Content-Type':'application/json',...(options.headers||{})}});const body=await response.json().catch(()=>({}));if(!response.ok)throw new Error(body.detail||`请求失败（${response.status}）`);return body;}
+async function init(){if(!token)return message('邀请链接缺少令牌。',true);try{invitation=await api(`/api/tenant-invitations/${encodeURIComponent(token)}`);$('intro').textContent=`邀请有效。${invitation.tenant_name?`这是“${invitation.tenant_name}”的接入邀请。`:''}请在下方填写贵企业自行创建的飞书自建应用信息。`;$('form').hidden=false;}catch(error){message(error.message,true);}}
+$('form').addEventListener('submit',async event=>{event.preventDefault();$('submit').disabled=true;message('正在验证飞书应用和企业通讯录权限...');try{const result=await api(`/api/tenant-invitations/${encodeURIComponent(token)}/accept`,{method:'POST',body:JSON.stringify({tenant_key:$('tenantKey').value.trim().toLowerCase(),tenant_name:invitation?.tenant_name||'',app_id:$('appId').value.trim(),app_secret:$('appSecret').value,redirect_uris:[$('redirectUri').value.trim()]})});$('form').hidden=true;$('success').hidden=false;$('success').innerHTML=`企业“${result.tenant.name}”已完成接入验证。<br><a href="${result.login_url}">进入企业登录入口</a>`;message('');}catch(error){message(error.message,true);$('submit').disabled=false;}});init();
+</script>
+</body>
+</html>
