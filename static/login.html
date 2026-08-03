@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>登录 - 扶摇AI Studio</title>
+    <title>登录 - 棱镜</title>
     <link rel="icon" href="/static/images/logo.png" type="image/png">
     <link rel="stylesheet" href="/static/vendor/css/fonts.css?v=2026.08.01.1784827838">
     <style>
@@ -14,33 +14,47 @@
         .mark { width:40px; height:40px; display:grid; place-items:center; border:2px solid var(--text); border-radius:8px; margin-bottom:24px; font-weight:800; }
         h1 { margin:0 0 10px; font-size:24px; line-height:1.3; }
         p { margin:0 0 24px; color:var(--muted); line-height:1.7; font-size:14px; }
-        a { min-height:44px; display:flex; align-items:center; justify-content:center; gap:9px; border-radius:6px; background:var(--primary); color:#fff; text-decoration:none; font-weight:700; }
-        a:hover { background:#2863e6; }
-        form { display:grid; gap:10px; margin-top:14px; padding-top:14px; border-top:1px solid var(--line); }
+        .login-methods { display:grid; grid-template-columns:1fr 1fr; gap:4px; margin:0 0 18px; padding:4px; border:1px solid var(--line); border-radius:8px; background:#f5f7fa; }
+        .login-methods[hidden], .login-panel[hidden] { display:none; }
+        .method-tab { min-height:36px; border:0; border-radius:6px; background:transparent; color:var(--muted); font:inherit; font-weight:700; cursor:pointer; }
+        .method-tab[aria-selected="true"] { background:#fff; color:var(--text); box-shadow:0 1px 3px rgba(23,25,29,.12); }
+        #loginBtn { width:100%; min-height:44px; display:flex; align-items:center; justify-content:center; gap:9px; border:0; border-radius:6px; background:var(--primary); color:#fff; font:inherit; font-weight:700; cursor:pointer; }
+        #loginBtn:hover:not(:disabled) { background:#2863e6; }
+        #loginBtn:disabled { background:#c8d0dc; color:#f8fafc; cursor:not-allowed; }
+        form { display:grid; gap:10px; }
         form[hidden] { display:none; }
         input, select { min-height:40px; padding:0 10px; border:1px solid var(--line); border-radius:6px; font:inherit; }
         form button { min-height:40px; border:0; border-radius:6px; background:#17202b; color:#fff; font-weight:700; cursor:pointer; }
-        .tenant-options { display:grid; gap:8px; margin-bottom:14px; }
+        .tenant-options { display:grid; gap:8px; margin:0 0 14px; padding:0; border:0; }
         .tenant-options[hidden] { display:none; }
-        .tenant-link { justify-content:flex-start; padding:0 14px; background:#f0f4ff; color:#174ea6; border:1px solid #c8d7ff; }
-        .tenant-link:hover { background:#e4edff; }
+        .tenant-option { width:100%; min-height:44px; padding:0 14px; border:1px solid #c8d7ff; border-radius:6px; background:#f7f9ff; color:#174ea6; font:inherit; font-weight:700; text-align:left; cursor:pointer; }
+        .tenant-option:hover { background:#eef3ff; }
+        .tenant-option.selected { border-color:var(--primary); background:#e8efff; box-shadow:0 0 0 1px var(--primary); }
         .status { margin-top:18px; padding-top:18px; border-top:1px solid var(--line); color:var(--muted); font-size:13px; line-height:1.6; }
         .status.error { color:#b42318; }
     </style>
 </head>
 <body>
     <main>
-        <div class="mark" aria-hidden="true">FY</div>
-        <h1>登录扶摇AI Studio</h1>
-        <p id="intro">使用企业飞书账号登录。你的菜单和操作权限将根据组织授权自动加载。</p>
-        <div id="tenantOptions" class="tenant-options" hidden></div>
-        <a id="loginBtn" href="/api/auth/feishu/login?return_to=%2F">使用飞书登录</a>
-        <form id="localLoginForm" hidden>
-            <select id="localTenant" aria-label="选择企业"></select>
-            <input id="localUsername" required autocomplete="username" placeholder="外部账号">
-            <input id="localPassword" required type="password" autocomplete="current-password" placeholder="密码">
-            <button type="submit">使用外部账号登录</button>
-        </form>
+        <div class="mark" aria-hidden="true">棱</div>
+        <h1>登录棱镜</h1>
+        <div id="loginMethods" class="login-methods" role="tablist" aria-label="登录方式" hidden>
+            <button id="feishuTab" class="method-tab" type="button" role="tab" aria-selected="true" aria-controls="feishuPanel">飞书登录</button>
+            <button id="localTab" class="method-tab" type="button" role="tab" aria-selected="false" aria-controls="localPanel">账号登录</button>
+        </div>
+        <section id="feishuPanel" class="login-panel" role="tabpanel" aria-labelledby="feishuTab">
+            <p id="intro">使用企业飞书账号登录。你的菜单和操作权限将根据组织授权自动加载。</p>
+            <div id="tenantOptions" class="tenant-options" role="radiogroup" aria-label="选择登录企业" hidden></div>
+            <button id="loginBtn" type="button" disabled>使用飞书登录</button>
+        </section>
+        <section id="localPanel" class="login-panel" role="tabpanel" aria-labelledby="localTab" hidden>
+            <form id="localLoginForm">
+                <select id="localTenant" aria-label="选择企业" required><option value="" selected disabled>请选择企业</option></select>
+                <input id="localUsername" required autocomplete="username" placeholder="账号">
+                <input id="localPassword" required type="password" autocomplete="current-password" placeholder="密码">
+                <button type="submit">使用账号登录</button>
+            </form>
+        </section>
         <div class="status" id="status">正在检查登录配置...</div>
     </main>
     <script>
@@ -49,25 +63,75 @@
             .then(config => {
                 const status = document.getElementById('status');
                 const loginButton = document.getElementById('loginBtn');
+                const loginMethods = document.getElementById('loginMethods');
+                const feishuTab = document.getElementById('feishuTab');
+                const localTab = document.getElementById('localTab');
+                const feishuPanel = document.getElementById('feishuPanel');
+                const localPanel = document.getElementById('localPanel');
                 const tenantOptions = document.getElementById('tenantOptions');
                 const intro = document.getElementById('intro');
                 const localForm = document.getElementById('localLoginForm');
                 const localTenant = document.getElementById('localTenant');
-                const tenants = Array.isArray(config.tenants) ? config.tenants.filter(item => item && item.enabled && item.slug && item.name) : [{tenant_key:config.default_tenant_key||'default',slug:config.default_tenant_key||'default',name:'默认企业',enabled:true}];
+                const tenants = Array.isArray(config.tenants) ? config.tenants.filter(item => item && item.enabled && item.slug && item.name) : [];
+                const setMode = mode => {
+                    const feishu = mode === 'feishu';
+                    feishuTab.setAttribute('aria-selected', feishu ? 'true' : 'false');
+                    localTab.setAttribute('aria-selected', feishu ? 'false' : 'true');
+                    feishuPanel.hidden = !feishu;
+                    localPanel.hidden = feishu;
+                };
+                feishuTab.addEventListener('click', () => setMode('feishu'));
+                localTab.addEventListener('click', () => setMode('local'));
                 if(config.sso_configured) {
                     status.textContent = '企业登录已连接，权限数据由本地安全存储维护';
                     const match = location.pathname.match(/^\/t\/([^/]+)/);
-                    if(match) loginButton.href = `/api/auth/feishu/login?tenant=${encodeURIComponent(match[1])}&return_to=%2F`;
-                    if(config.local_auth_enabled){localTenant.innerHTML=tenants.map(item=>`<option value="${item.tenant_key}">${item.name}</option>`).join('');localForm.hidden=false;}
-                    if(!match && tenants.length > 1) {
-                        intro.textContent = '请选择要登录的企业，系统将使用该企业自己的飞书应用完成认证。';
-                        tenantOptions.innerHTML = tenants.map(item => `<a class="tenant-link" href="/api/auth/feishu/login?tenant=${encodeURIComponent(item.slug)}&return_to=%2F">${String(item.name).replace(/[&<>'"]/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[char]))}</a>`).join('');
-                        tenantOptions.hidden = false;
-                        loginButton.hidden = true;
-                    }
+                    let selectedTenant = '';
+                    intro.textContent = '请先选择企业，系统将使用该企业自己的飞书应用完成认证。';
+                    tenants.forEach(item => {
+                        const option = document.createElement('button');
+                        option.type = 'button';
+                        option.className = 'tenant-option';
+                        option.dataset.tenant = item.slug;
+                        option.setAttribute('role', 'radio');
+                        option.setAttribute('aria-checked', 'false');
+                        option.textContent = item.name;
+                        option.addEventListener('click', () => {
+                            selectedTenant = item.slug;
+                            tenantOptions.querySelectorAll('.tenant-option').forEach(node => {
+                                const selected = node === option;
+                                node.classList.toggle('selected', selected);
+                                node.setAttribute('aria-checked', selected ? 'true' : 'false');
+                            });
+                            loginButton.disabled = false;
+                            status.classList.remove('error');
+                            status.textContent = `已选择：${item.name}`;
+                        });
+                        tenantOptions.appendChild(option);
+                    });
+                    tenantOptions.hidden = tenants.length === 0;
+                    loginButton.hidden = tenants.length === 0;
+                    loginButton.addEventListener('click', () => {
+                        if(!selectedTenant) return;
+                        loginButton.disabled = true;
+                        location.href = `/api/auth/feishu/login?tenant=${encodeURIComponent(selectedTenant)}&return_to=%2F`;
+                    });
+                    if(match) tenantOptions.querySelector(`[data-tenant="${CSS.escape(decodeURIComponent(match[1]))}"]`)?.click();
+                    if(config.local_auth_enabled){
+                        loginMethods.hidden = false;
+                        tenants.forEach(item=>{const option=document.createElement('option');option.value=item.tenant_key;option.textContent=item.name;localTenant.appendChild(option);});
+                    } else { localTab.hidden = true; }
+                    if(!tenants.length){status.classList.add('error');status.textContent='当前没有可登录的企业，请联系平台管理员';}
                     return;
                 }
-                if(config.local_auth_enabled){localTenant.innerHTML=tenants.map(item=>`<option value="${item.tenant_key}">${item.name}</option>`).join('');localForm.hidden=false;loginButton.hidden=true;status.textContent='请输入管理员提供的外部账号';return;}
+                if(config.local_auth_enabled){
+                    feishuTab.hidden = true;
+                    loginMethods.hidden = true;
+                    feishuPanel.hidden = true;
+                    localPanel.hidden = false;
+                    tenants.forEach(item=>{const option=document.createElement('option');option.value=item.tenant_key;option.textContent=item.name;localTenant.appendChild(option);});
+                    status.textContent='请选择企业并输入管理员提供的外部账号';
+                    return;
+                }
                 status.classList.add('error');
                 status.textContent = `飞书登录尚未配置完整：${(config.missing_sso_fields || []).join('、')}`;
                 loginButton.hidden = true;

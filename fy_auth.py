@@ -26,6 +26,7 @@ FEISHU_AUTHORIZE_URL = "https://accounts.feishu.cn/open-apis/authen/v1/authorize
 SESSION_COOKIE = "fy_session"
 OAUTH_STATE_COOKIE = "fy_oauth_state"
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+TENANT_NAME_SYNC_INTERVAL_SECONDS = 5 * 60
 
 
 def _auth_env_file() -> str:
@@ -712,7 +713,7 @@ class FeishuClient:
         """Read the enterprise profile exposed by the tenant information API."""
         payload = await self._request(
             "GET",
-            f"{FEISHU_OPEN_API}/tenant/v2/tenant",
+            f"{FEISHU_OPEN_API}/tenant/v2/tenant/query",
             headers=await self.tenant_headers(),
         )
         data = payload.get("data") or {}
@@ -809,6 +810,15 @@ class SQLitePermissionStore:
                     PRIMARY KEY (tenant_id, identity_key),
                     FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id) ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS departments (
+                    tenant_id TEXT NOT NULL,
+                    department_id TEXT NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    parent_department_id TEXT NOT NULL DEFAULT '',
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (tenant_id, department_id),
+                    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id) ON DELETE CASCADE
+                );
                 CREATE TABLE IF NOT EXISTS tenant_invitations (
                     token_hash TEXT PRIMARY KEY,
                     tenant_name TEXT NOT NULL DEFAULT '',
@@ -818,7 +828,7 @@ class SQLitePermissionStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_members_lookup ON members(tenant_id, open_id, user_id, email, mobile);
                 INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('version', '1');
-                UPDATE schema_meta SET value = '2' WHERE key = 'version';
+                UPDATE schema_meta SET value = '3' WHERE key = 'version';
                 """
             )
             for tenant_key, config in (self.settings.tenants or {}).items():
@@ -1019,10 +1029,48 @@ class SQLitePermissionStore:
         self._cache_expires_at = 0
         return (await self.member_for(user, tenant_key)) or {}
 
-    async def sync_directory(self, users: List[Dict[str, Any]], tenant_key: str = "") -> None:
+    def directory_departments(self, tenant_key: str = "") -> List[Dict[str, Any]]:
+        tenant_id = self.tenant_id(tenant_key)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                "SELECT department_id, name, parent_department_id, updated_at FROM departments WHERE tenant_id = ? ORDER BY name, department_id",
+                (tenant_id,),
+            ).fetchall()
+        return [
+            {
+                "open_department_id": row["department_id"],
+                "name": row["name"],
+                "parent_department_id": row["parent_department_id"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ]
+
+    async def sync_directory(
+        self,
+        users: List[Dict[str, Any]],
+        tenant_key: str = "",
+        departments: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
         tenant_id = self.tenant_id(tenant_key)
         seen = set()
         with self._lock, self._connect() as connection:
+            if departments is not None:
+                connection.execute("DELETE FROM departments WHERE tenant_id = ?", (tenant_id,))
+                for department in departments:
+                    department_id = _field_text(department.get("open_department_id") or department.get("department_id"))
+                    if not department_id:
+                        continue
+                    connection.execute(
+                        "INSERT INTO departments(tenant_id, department_id, name, parent_department_id, updated_at) VALUES (?, ?, ?, ?, ?)",
+                        (
+                            tenant_id,
+                            department_id,
+                            _field_text(department.get("name")),
+                            _field_text(department.get("parent_department_id") or department.get("parent_open_department_id")),
+                            self._now(),
+                        ),
+                    )
             for user in users:
                 identity = self._identity_key(user)
                 if not identity:
@@ -1117,6 +1165,7 @@ class AuthService:
         self._organization_expires_at: Dict[str, float] = {}
         self._department_cache: Dict[str, List[Dict[str, Any]]] = {}
         self._department_expires_at: Dict[str, float] = {}
+        self._tenant_name_expires_at: Dict[str, float] = {}
 
     def feishu_for(self, tenant_key: str = "") -> FeishuClient:
         key = _field_text(tenant_key).lower() or self.settings.default_tenant_key
@@ -1134,6 +1183,15 @@ class AuthService:
         if not key:
             return False
         return key == self.settings.default_tenant_key or any(item.get("tenant_key") == key for item in self.list_tenants())
+
+    def tenant_key_for_identifier(self, identifier: str = "") -> str:
+        value = _field_text(identifier).lower()
+        if not value:
+            return ""
+        for tenant in self.list_tenants():
+            if value in {_field_text(tenant.get("tenant_key")).lower(), _field_text(tenant.get("slug")).lower()}:
+                return _field_text(tenant.get("tenant_key")).lower()
+        return ""
 
     def list_tenants(self) -> List[Dict[str, Any]]:
         stored = {item["tenant_key"]: item for item in self.store.list_tenants()}
@@ -1194,6 +1252,7 @@ class AuthService:
         self.settings = replace(self.settings, tenants=tenants)
         self.store.settings = self.settings
         self._clients.pop(key, None)
+        self._tenant_name_expires_at.pop(key, None)
         self.store.set_tenant_enabled(key, config["enabled"], config["name"])
         if key == self.settings.default_tenant_key:
             self.feishu = self.feishu_for(key)
@@ -1216,6 +1275,7 @@ class AuthService:
         self.settings = replace(self.settings, tenants=tenants)
         self.store.settings = self.settings
         self._clients.pop(key, None)
+        self._tenant_name_expires_at.pop(key, None)
         self._organization_cache.pop(key, None)
         self._organization_expires_at.pop(key, None)
         return True
@@ -1241,20 +1301,39 @@ class AuthService:
             "enabled": self.is_tenant_enabled(key),
         }
 
-    async def refresh_tenant_display_name(self, tenant_key: str = "") -> Dict[str, Any]:
+    async def sync_tenant_profile(self, tenant_key: str = "", force: bool = False, strict: bool = False) -> Dict[str, Any]:
         summary = self.tenant_summary(tenant_key)
         key = summary["tenant_key"]
-        if summary["name"] not in {"当前企业", key} and not re.fullmatch(r"[a-f0-9]{12,}", summary["name"] or ""):
+        config = self.tenant_config(key)
+        if not _field_text(config.get("app_id")) or not _field_text(config.get("app_secret")):
+            if strict:
+                raise FeishuAPIError("企业尚未配置飞书应用凭据")
+            return summary
+        now = time.time()
+        if not force and now < self._tenant_name_expires_at.get(key, 0):
             return summary
         try:
-            root = await self.feishu_for(key).get_root_department()
-            name = _field_text(root.get("name"))
-            if name:
-                self.store.set_tenant_enabled(key, summary["enabled"], name)
-                summary["name"] = name
-        except FeishuAPIError:
-            pass
+            tenant = await self.feishu_for(key).get_tenant_info()
+            name = _field_text(tenant.get("name") or tenant.get("tenant_name"))
+            if not name:
+                raise FeishuAPIError("飞书企业信息接口未返回企业名称")
+            self.store.set_tenant_enabled(key, summary["enabled"], name)
+            summary["name"] = name
+            self._tenant_name_expires_at[key] = now + TENANT_NAME_SYNC_INTERVAL_SECONDS
+        except FeishuAPIError as exc:
+            self._tenant_name_expires_at[key] = now + 60
+            if strict:
+                raise FeishuAPIError(
+                    f"同步企业信息失败，请确认飞书应用已开通 tenant:tenant:readonly：{exc}"
+                ) from exc
         return summary
+
+    async def sync_all_tenant_profiles(self, force: bool = False) -> List[Dict[str, Any]]:
+        await asyncio.gather(*(
+            self.sync_tenant_profile(item["tenant_key"], force=force)
+            for item in self.list_tenants()
+        ), return_exceptions=True)
+        return self.list_tenants()
 
     async def department_names_for_user(self, user: Dict[str, Any]) -> List[str]:
         existing = [_field_text(item) for item in _json_list(user.get("department_names"))]
@@ -1267,11 +1346,8 @@ class AuthService:
             return []
         tenant_key = _field_text(user.get("tenant_key")).lower() or self.settings.default_tenant_key
         if not self._department_cache.get(tenant_key) or time.time() >= self._department_expires_at.get(tenant_key, 0):
-            try:
-                self._department_cache[tenant_key] = await self.feishu_for(tenant_key).list_departments()
-                self._department_expires_at[tenant_key] = time.time() + 300
-            except FeishuAPIError:
-                return []
+            self._department_cache[tenant_key] = self.store.directory_departments(tenant_key)
+            self._department_expires_at[tenant_key] = time.time() + 300
         names_by_id = {
             _field_text(item.get("open_department_id") or item.get("department_id")): _field_text(item.get("name"))
             for item in self._department_cache.get(tenant_key, [])
@@ -1392,6 +1468,7 @@ class AuthService:
         return permission in set(user.get("permissions") or [])
 
     def public_config(self) -> Dict[str, Any]:
+        tenants = self.list_tenants()
         return {
             "sso_enabled": True,
             "sso_configured": self.settings.sso_configured,
@@ -1401,8 +1478,13 @@ class AuthService:
             "default_role": self.settings.default_role,
             "default_tenant_key": self.settings.default_tenant_key,
             "tenants": [
-                {"tenant_key": key, "slug": value.get("slug") or key, "name": value.get("name") or key, "enabled": self.is_tenant_enabled(key)}
-                for key, value in (self.settings.tenants or {}).items()
+                {
+                    "tenant_key": item["tenant_key"],
+                    "slug": item.get("slug") or item["tenant_key"],
+                    "name": item.get("name") or item["tenant_key"],
+                    "enabled": item["enabled"],
+                }
+                for item in tenants
             ],
         }
 
@@ -1431,8 +1513,6 @@ class AuthService:
         if root_name:
             root_department = {**root_department, "open_department_id": _field_text(root_department.get("open_department_id")) or "0", "name": root_name}
             departments = [root_department, *[item for item in departments if _field_text(item.get("open_department_id") or item.get("department_id")) != "0"]]
-            current = next((item for item in self.list_tenants() if item.get("tenant_key") == key), {})
-            self.store.set_tenant_enabled(key, bool(current.get("enabled", True)), root_name)
         self._department_cache[key] = departments
         self._department_expires_at[key] = time.time() + 300
         department_ids = [
@@ -1463,7 +1543,7 @@ class AuthService:
                 merged["department_ids"] = list(dict.fromkeys(item for item in memberships if item))
                 users_by_id[key_value] = merged
         directory_users = list(users_by_id.values())
-        await self.store.sync_directory(directory_users, key)
+        await self.store.sync_directory(directory_users, key, departments=departments)
         self._organization_cache[key] = {"departments": departments, "directory_users": directory_users}
         self._organization_expires_at[key] = time.time() + 60
         return {"tenant_key": key, "departments": departments, "users": directory_users, "synced_at": int(time.time() * 1000)}
@@ -1514,16 +1594,19 @@ class AuthService:
 
     async def organization(self, current_user: Optional[Dict[str, Any]] = None, refresh: bool = False) -> Dict[str, Any]:
         tenant_key = _field_text((current_user or {}).get("tenant_key")).lower() or self.settings.default_tenant_key
-        if refresh or not self._organization_cache.get(tenant_key) or time.time() >= self._organization_expires_at.get(tenant_key, 0):
+        if refresh:
             await self.sync_directory(tenant_key, allow_unregistered=True)
 
-        organization_cache = self._organization_cache.get(tenant_key) or {}
-        departments = organization_cache.get("departments") or []
-        directory_users = list(organization_cache.get("directory_users") or [])
+        cache_is_current = time.time() < self._organization_expires_at.get(tenant_key, 0)
+        organization_cache = (self._organization_cache.get(tenant_key) or {}) if cache_is_current else {}
+        snapshot = await self.store.snapshot(tenant_key)
+        departments = organization_cache.get("departments") or self.store.directory_departments(tenant_key)
+        directory_users = list(organization_cache.get("directory_users") or [
+            item for item in snapshot["members"] if item.get("directory_state") != "missing"
+        ])
         current_ids = _identity_values(current_user)
         if current_user and current_ids and not any(current_ids.intersection(_identity_values(item)) for item in directory_users):
             directory_users.append(current_user)
-        snapshot = await self.store.snapshot(tenant_key)
         users = []
         for item in directory_users:
             assignment = next(
@@ -1548,7 +1631,12 @@ class AuthService:
                 "is_current": is_current,
                 "is_super_admin": is_super_admin,
                 "is_tenant_admin": not is_super_admin and role_name == "admin",
-                "managed": bool(assignment),
+                "managed": bool(
+                    assignment.get("managed")
+                    or assignment.get("role")
+                    or assignment.get("is_tenant_admin")
+                    or assignment.get("status") == "disabled"
+                ),
             })
         result = {
             "departments": departments,
@@ -1611,7 +1699,7 @@ def register_auth(app, service: AuthService) -> None:
             raise HTTPException(status_code=401, detail="请使用飞书登录")
         public_user = dict(user)
         public_user["department_names"] = await service.department_names_for_user(public_user)
-        tenant = await service.refresh_tenant_display_name(public_user.get("tenant_key"))
+        tenant = service.tenant_summary(public_user.get("tenant_key"))
         return {
             "user": public_user,
             "tenant": tenant,
@@ -1640,7 +1728,8 @@ def register_auth(app, service: AuthService) -> None:
         return response
 
     async def auth_login(request: Request, return_to: str = "/", tenant_slug: str = ""):
-        tenant_key = _field_text(tenant_slug or request.query_params.get("tenant") or service.settings.default_tenant_key).lower()
+        tenant_identifier = _field_text(tenant_slug or request.query_params.get("tenant") or service.settings.default_tenant_key).lower()
+        tenant_key = service.tenant_key_for_identifier(tenant_identifier) or tenant_identifier
         config = service.tenant_config(tenant_key)
         if not service.tenant_exists(tenant_key) or not config or not config.get("enabled", True):
             raise HTTPException(status_code=404, detail="企业租户不存在或已停用")
@@ -1938,6 +2027,18 @@ def register_auth(app, service: AuthService) -> None:
             result = await service.sync_directory(tenant_key)
             return {"tenant_key": result["tenant_key"], "departments": len(result["departments"]), "members": len(result["users"]), "synced_at": result["synced_at"]}
         except FeishuAPIError as exc:
+            raise HTTPException(status_code=502, detail=f"同步成员失败：{exc}") from exc
+
+    async def sync_tenant_profile(request: Request, tenant_key: str):
+        user = await service.current_user(request)
+        if not user or not user.get("is_super_admin"):
+            raise HTTPException(status_code=403, detail="只有平台超管可以同步企业信息")
+        if not service.tenant_exists(tenant_key):
+            raise HTTPException(status_code=404, detail="企业不存在")
+        try:
+            tenant = await service.sync_tenant_profile(tenant_key, force=True, strict=True)
+            return {"tenant_key": tenant["tenant_key"], "name": tenant["name"], "synced_at": int(time.time())}
+        except FeishuAPIError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     async def create_tenant_invitation(request: Request, payload: Dict[str, Any] = Body(...)):
@@ -1970,15 +2071,33 @@ def register_auth(app, service: AuthService) -> None:
         if not service.store.claim_tenant_invitation(token):
             raise HTTPException(status_code=410, detail="邀请链接已使用或已过期")
         success = False
+        saved_tenant_key = ""
         try:
             verified = await service.verify_tenant_connection(payload)
             saved = service.save_tenant({**payload, "name": verified["enterprise_name"], "enabled": True})
+            saved_tenant_key = saved["tenant_key"]
+            profile = await service.sync_tenant_profile(saved_tenant_key, force=True, strict=True)
+            try:
+                directory = await service.sync_directory(saved_tenant_key)
+            except FeishuAPIError as exc:
+                raise FeishuAPIError(f"同步成员失败：{exc}") from exc
+            saved = next(item for item in service.list_tenants() if item["tenant_key"] == saved_tenant_key)
             success = True
             return {
                 "tenant": saved, "verified": True,
+                "initial_sync": {
+                    "name": profile["name"],
+                    "departments": len(directory["departments"]),
+                    "members": len(directory["users"]),
+                },
                 "login_url": "/",
             }
         except FeishuAPIError as exc:
+            if saved_tenant_key:
+                try:
+                    service.remove_tenant(saved_tenant_key)
+                except FeishuAPIError:
+                    pass
             raise HTTPException(status_code=502, detail=str(exc)) from exc
         finally:
             service.store.finish_tenant_invitation(token, success)
@@ -2014,6 +2133,7 @@ def register_auth(app, service: AuthService) -> None:
     app.add_api_route("/api/admin/tenants/{tenant_key}", update_tenant, methods=["PUT"])
     app.add_api_route("/api/admin/tenants/{tenant_key}", delete_tenant, methods=["DELETE"])
     app.add_api_route("/api/admin/tenants/{tenant_key}/sync", sync_tenant, methods=["POST"])
+    app.add_api_route("/api/admin/tenants/{tenant_key}/sync-profile", sync_tenant_profile, methods=["POST"])
     app.add_api_route("/api/admin/tenant-invitations", create_tenant_invitation, methods=["POST"])
     app.add_api_route("/api/tenant-invitations/{token}", get_tenant_invitation, methods=["GET"])
     app.add_api_route("/api/tenant-invitations/{token}/accept", accept_tenant_invitation, methods=["POST"])
@@ -2021,6 +2141,26 @@ def register_auth(app, service: AuthService) -> None:
     app.add_api_route("/api/admin/members/{open_id}", delete_member, methods=["DELETE"])
     app.add_api_route("/api/admin/roles/{role_name}", save_role, methods=["PUT"])
     app.add_api_route("/api/admin/roles/{role_name}", delete_role, methods=["DELETE"])
+
+    async def tenant_name_sync_loop() -> None:
+        while True:
+            await service.sync_all_tenant_profiles(force=True)
+            await asyncio.sleep(TENANT_NAME_SYNC_INTERVAL_SECONDS)
+
+    async def start_tenant_name_sync() -> None:
+        app.state.fy_tenant_name_sync_task = asyncio.create_task(tenant_name_sync_loop())
+
+    async def stop_tenant_name_sync() -> None:
+        task = getattr(app.state, "fy_tenant_name_sync_task", None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    app.router.add_event_handler("startup", start_tenant_name_sync)
+    app.router.add_event_handler("shutdown", stop_tenant_name_sync)
 
 
 PUBLIC_AUTH_PATHS = {

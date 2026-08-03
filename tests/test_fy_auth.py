@@ -20,6 +20,7 @@ from fy_auth import (  # noqa: E402
     DEFAULT_ROLES,
     FeishuAPIError,
     SignedTokenCodec,
+    TENANT_NAME_SYNC_INTERVAL_SECONDS,
     _management_permission,
     auth_middleware,
     register_auth,
@@ -274,6 +275,21 @@ class FeishuSSOTests(unittest.TestCase):
         self.assertTrue(profile_request.args[1].endswith("/authen/v1/user_info"))
         self.assertEqual(profile_request.kwargs["headers"], {"Authorization": "Bearer u-token"})
 
+    def test_tenant_info_uses_feishu_query_endpoint(self):
+        service = self.configured_service()
+        service.feishu.tenant_headers = AsyncMock(return_value={"Authorization": "Bearer tenant-token"})
+        service.feishu._request = AsyncMock(return_value={
+            "code": 0,
+            "data": {"tenant": {"name": "飞书实际企业名称"}},
+        })
+
+        result = asyncio.run(service.feishu.get_tenant_info())
+
+        self.assertEqual(result["name"], "飞书实际企业名称")
+        request = service.feishu._request.await_args
+        self.assertEqual(request.args[0], "GET")
+        self.assertTrue(request.args[1].endswith("/tenant/v2/tenant/query"))
+
     def test_login_selects_callback_matching_request_origin(self):
         service = self.configured_service()
         app = FastAPI()
@@ -405,9 +421,57 @@ class FeishuSSOTests(unittest.TestCase):
         self.assertEqual(error.exception.status_code, 503)
 
 
+class LoginPageTenantSelectionTests(unittest.TestCase):
+    def test_feishu_login_stays_disabled_until_a_tenant_is_selected(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "static", "login.html")
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+
+        self.assertIn('id="loginMethods"', source)
+        self.assertIn('id="feishuTab"', source)
+        self.assertIn('id="localTab"', source)
+        self.assertIn('id="feishuPanel"', source)
+        self.assertIn('id="localPanel"', source)
+        self.assertIn('id="feishuTab" class="method-tab" type="button" role="tab" aria-selected="true"', source)
+        self.assertIn('<button id="loginBtn" type="button" disabled>使用飞书登录</button>', source)
+        self.assertIn("let selectedTenant = '';", source)
+        self.assertIn("loginButton.disabled = false;", source)
+        self.assertIn("if(!selectedTenant) return;", source)
+        self.assertIn("localTab.addEventListener('click', () => setMode('local'));", source)
+        self.assertNotIn('href="/api/auth/feishu/login?return_to=%2F"', source)
+
+    def test_local_login_requires_a_tenant_option(self):
+        path = os.path.join(os.path.dirname(__file__), "..", "static", "login.html")
+        with open(path, "r", encoding="utf-8") as handle:
+            source = handle.read()
+
+        self.assertIn('<select id="localTenant" aria-label="选择企业" required>', source)
+        self.assertIn('<option value="" selected disabled>请选择企业</option>', source)
+        self.assertIn('placeholder="账号"', source)
+
+
 class OrganizationTests(unittest.TestCase):
+    def test_tenant_name_sync_interval_is_five_minutes(self):
+        self.assertEqual(TENANT_NAME_SYNC_INTERVAL_SECONDS, 300)
+
+    def test_organization_ui_exposes_separate_profile_and_member_sync_actions(self):
+        html_path = os.path.join(os.path.dirname(__file__), "..", "static", "org-permissions.html")
+        js_path = os.path.join(os.path.dirname(__file__), "..", "static", "js", "org-permissions.js")
+        with open(html_path, "r", encoding="utf-8") as handle:
+            html_source = handle.read()
+        with open(js_path, "r", encoding="utf-8") as handle:
+            js_source = handle.read()
+
+        self.assertIn('id="syncTenantProfileBtn"', html_source)
+        self.assertIn('id="syncTenantBtn"', html_source)
+        self.assertIn('/sync-profile`,{method:\'POST\'}', js_source)
+        self.assertIn('/sync`,{method:\'POST\'}', js_source)
+        self.assertIn('Promise.all([', js_source)
+        self.assertNotIn('refresh=true', js_source)
+
     def test_organization_syncs_root_users_and_marks_managed_assignments(self):
         service = AuthService(settings(super_admin_ids=["ou_super_admin"]))
+        service.store.set_tenant_enabled("tenant_fy", True, "测试企业")
         service.feishu.list_departments = AsyncMock(return_value=[
             {"open_department_id": "od_sales", "name": "销售部"},
         ])
@@ -425,7 +489,7 @@ class OrganizationTests(unittest.TestCase):
             "source": "local",
         })
         current_user = {"open_id": "ou_super_admin", "tenant_key": "tenant_fy", "is_super_admin": True}
-        result = asyncio.run(service.organization(current_user=current_user))
+        result = asyncio.run(service.organization(current_user=current_user, refresh=True))
         users = {user["open_id"]: user for user in result["users"]}
         self.assertEqual(users["ou_super_admin"]["role"], "admin")
         self.assertFalse(users["ou_super_admin"]["managed"])
@@ -477,9 +541,10 @@ class OrganizationTests(unittest.TestCase):
             "department_ids": ["od_product"], "role": "member", "permissions": [],
             "is_super_admin": False, "is_tenant_admin": False,
         })
-        service.feishu.list_departments = AsyncMock(return_value=[
+        asyncio.run(service.store.sync_directory([], "default", departments=[
             {"open_department_id": "od_product", "name": "产品部"},
-        ])
+        ]))
+        service.feishu.list_departments = AsyncMock(side_effect=AssertionError("auth/me must not query Feishu"))
         app = FastAPI()
         register_auth(app, service)
         auth_me = endpoint(app, "/api/auth/me")
@@ -487,6 +552,26 @@ class OrganizationTests(unittest.TestCase):
         self.assertEqual(result["tenant"]["name"], "示例企业")
         self.assertEqual(result["user"]["department_names"], ["产品部"])
         self.assertEqual(result["config"]["permission_store"], "local")
+        service.feishu.list_departments.assert_not_awaited()
+
+    def test_organization_initial_load_reads_sqlite_without_feishu_requests(self):
+        service = AuthService(settings(db_path=":memory:"))
+        asyncio.run(service.store.sync_directory(
+            [{"open_id": "ou_local", "name": "本地成员", "department_ids": ["od_product"]}],
+            "default",
+            departments=[{"open_department_id": "od_product", "name": "产品部"}],
+        ))
+        service.feishu.get_root_department = AsyncMock(side_effect=AssertionError("initial load must stay local"))
+        service.feishu.list_departments = AsyncMock(side_effect=AssertionError("initial load must stay local"))
+        service.feishu.list_users_for_department = AsyncMock(side_effect=AssertionError("initial load must stay local"))
+
+        result = asyncio.run(service.organization(current_user={"open_id": "ou_local", "tenant_key": "default"}))
+
+        self.assertEqual(result["departments"][0]["name"], "产品部")
+        self.assertEqual(result["users"][0]["name"], "本地成员")
+        service.feishu.get_root_department.assert_not_awaited()
+        service.feishu.list_departments.assert_not_awaited()
+        service.feishu.list_users_for_department.assert_not_awaited()
 
     def test_tenant_summary_does_not_expose_internal_identifier_as_name(self):
         service = AuthService(settings(db_path=":memory:"))
@@ -507,6 +592,67 @@ class OrganizationTests(unittest.TestCase):
     def test_default_tenant_summary_uses_friendly_fallback_name(self):
         service = AuthService(settings(db_path=":memory:"))
         self.assertEqual(service.tenant_summary("default")["name"], "默认企业")
+
+    def test_default_tenant_display_name_refreshes_from_feishu_tenant_info(self):
+        service = AuthService(settings(
+            app_id="cli_default", app_secret="secret_default", redirect_uri=LOCAL_CALLBACK,
+            redirect_uris=[LOCAL_CALLBACK], db_path=":memory:",
+        ))
+        service.feishu.get_tenant_info = AsyncMock(return_value={"name": "扶摇Studio"})
+        service.feishu.get_root_department = AsyncMock(side_effect=AssertionError("tenant info should be preferred"))
+
+        summary = asyncio.run(service.sync_tenant_profile("default"))
+
+        self.assertEqual(summary["name"], "扶摇Studio")
+        self.assertEqual(service.list_tenants()[0]["name"], "扶摇Studio")
+
+    def test_feishu_tenant_name_replaces_a_stale_custom_name(self):
+        service = AuthService(settings(
+            app_id="cli_default", app_secret="secret_default", redirect_uri=LOCAL_CALLBACK,
+            redirect_uris=[LOCAL_CALLBACK], db_path=":memory:",
+        ))
+        service.store.set_tenant_enabled("default", True, "扶摇企业")
+        service.feishu.get_tenant_info = AsyncMock(return_value={"name": "飞书实际企业名称"})
+        service.feishu.get_root_department = AsyncMock(side_effect=AssertionError("tenant info should be preferred"))
+
+        summary = asyncio.run(service.sync_tenant_profile("default"))
+
+        self.assertEqual(summary["name"], "飞书实际企业名称")
+        self.assertEqual(service.list_tenants()[0]["name"], "飞书实际企业名称")
+
+    def test_platform_tenant_list_reads_names_from_database(self):
+        service = AuthService(settings(
+            app_id="cli_default", app_secret="secret_default", redirect_uri=LOCAL_CALLBACK,
+            redirect_uris=[LOCAL_CALLBACK], db_path=":memory:", super_admin_ids=["ou_admin"],
+        ))
+        service.store.set_tenant_enabled("default", True, "扶摇企业")
+        service.feishu.get_tenant_info = AsyncMock(return_value={"name": "飞书实际企业名称"})
+        service.feishu.get_root_department = AsyncMock(side_effect=AssertionError("tenant info should be preferred"))
+        service.current_user = AsyncMock(return_value={"open_id": "ou_admin", "is_super_admin": True})
+        app = FastAPI()
+        register_auth(app, service)
+
+        list_tenants = endpoint(app, "/api/admin/tenants")
+        result = asyncio.run(list_tenants(MiddlewareBoundaryTests.request()))
+
+        self.assertEqual(result["tenants"][0]["name"], "扶摇企业")
+        service.feishu.get_tenant_info.assert_not_awaited()
+
+    def test_public_auth_config_reads_tenant_names_from_database(self):
+        service = AuthService(settings(
+            app_id="cli_default", app_secret="secret_default", redirect_uri=LOCAL_CALLBACK,
+            redirect_uris=[LOCAL_CALLBACK], db_path=":memory:",
+        ))
+        service.store.set_tenant_enabled("default", True, "数据库企业名称")
+        service.feishu.get_tenant_info = AsyncMock(return_value={"name": "飞书即时名称"})
+        app = FastAPI()
+        register_auth(app, service)
+
+        auth_config = endpoint(app, "/api/auth/config")
+        result = asyncio.run(auth_config())
+
+        self.assertEqual(result["tenants"][0]["name"], "数据库企业名称")
+        service.feishu.get_tenant_info.assert_not_awaited()
 
     def test_platform_admin_can_add_and_remove_tenants_but_not_last(self):
         service = AuthService(AuthSettings(
@@ -538,6 +684,7 @@ class OrganizationTests(unittest.TestCase):
             },
         ))
         client = service.feishu_for("second")
+        client.get_tenant_info = AsyncMock(side_effect=AssertionError("member sync must not query tenant profile"))
         client.get_root_department = AsyncMock(return_value={"open_department_id": "0", "name": "第二企业"})
         client.list_departments = AsyncMock(return_value=[{"open_department_id": "od_sales", "name": "销售部"}])
         client.list_users_for_department = AsyncMock(return_value=[{"open_id": "ou_second", "name": "第二企业成员"}])
@@ -548,8 +695,53 @@ class OrganizationTests(unittest.TestCase):
         result = asyncio.run(sync(MiddlewareBoundaryTests.request(method="POST", path="/api/admin/tenants/second/sync"), "second"))
         self.assertEqual(result["tenant_key"], "second")
         self.assertEqual(result["members"], 1)
+        self.assertEqual(service.tenant_summary("second")["name"], "第二企业")
+        client.get_tenant_info.assert_not_awaited()
         member = asyncio.run(service.store.member_for({"open_id": "ou_second"}, "second"))
         self.assertEqual(member["name"], "第二企业成员")
+
+    def test_platform_admin_can_sync_tenant_profile_independently(self):
+        service = AuthService(AuthSettings(
+            app_id="cli_default", app_secret="secret_default", redirect_uri=LOCAL_CALLBACK,
+            redirect_uris=[LOCAL_CALLBACK], session_secret="test-secret", super_admin_ids=["ou_admin"],
+            cookie_secure=False, default_role="member", db_path=":memory:",
+            tenants={
+                "default": {"tenant_key": "default", "name": "旧企业名称", "app_id": "cli_default", "app_secret": "secret_default", "redirect_uris": [LOCAL_CALLBACK], "enabled": True},
+            },
+        ))
+        service.feishu.get_tenant_info = AsyncMock(return_value={"name": "飞书企业名称"})
+        service.feishu.get_root_department = AsyncMock(side_effect=AssertionError("profile sync must not query contacts"))
+        service.current_user = AsyncMock(return_value={"open_id": "ou_admin", "tenant_key": "default", "is_super_admin": True})
+        service._tenant_name_expires_at["default"] = time.time() + 300
+        app = FastAPI()
+        register_auth(app, service)
+
+        sync_profile = endpoint(app, "/api/admin/tenants/{tenant_key}/sync-profile", "POST")
+        result = asyncio.run(sync_profile(
+            MiddlewareBoundaryTests.request(method="POST", path="/api/admin/tenants/default/sync-profile"),
+            "default",
+        ))
+
+        self.assertEqual(result["name"], "飞书企业名称")
+        self.assertEqual(service.tenant_summary("default")["name"], "飞书企业名称")
+        service.feishu.get_root_department.assert_not_awaited()
+
+    def test_tenant_profile_sync_reports_its_own_permission_error(self):
+        service = AuthService(settings(
+            app_id="cli_default", app_secret="secret_default", redirect_uri=LOCAL_CALLBACK,
+            redirect_uris=[LOCAL_CALLBACK], db_path=":memory:", super_admin_ids=["ou_admin"],
+        ))
+        service.feishu.get_tenant_info = AsyncMock(side_effect=FeishuAPIError("缺少 tenant:tenant:readonly"))
+        service.current_user = AsyncMock(return_value={"open_id": "ou_admin", "is_super_admin": True})
+        app = FastAPI()
+        register_auth(app, service)
+        sync_profile = endpoint(app, "/api/admin/tenants/{tenant_key}/sync-profile", "POST")
+
+        with self.assertRaises(HTTPException) as error:
+            asyncio.run(sync_profile(MiddlewareBoundaryTests.request(method="POST"), "default"))
+
+        self.assertEqual(error.exception.status_code, 502)
+        self.assertIn("tenant:tenant:readonly", error.exception.detail)
 
     def test_tenant_invitation_is_one_time_and_stores_only_hash(self):
         service = AuthService(settings(db_path=":memory:"))
@@ -569,6 +761,11 @@ class OrganizationTests(unittest.TestCase):
         ))
         service.current_user = AsyncMock(return_value={"open_id": "ou_admin", "tenant_key": "default", "is_super_admin": True})
         service.verify_tenant_connection = AsyncMock(return_value={"verified": True, "enterprise_name": "第二企业"})
+        service.sync_tenant_profile = AsyncMock(return_value={"tenant_key": "second", "name": "第二企业"})
+        service.sync_directory = AsyncMock(return_value={
+            "tenant_key": "second", "departments": [{"name": "总办"}],
+            "users": [{"open_id": "ou_member"}], "synced_at": 1,
+        })
         app = FastAPI()
         register_auth(app, service)
         create = endpoint(app, "/api/admin/tenant-invitations", "POST")
@@ -578,8 +775,39 @@ class OrganizationTests(unittest.TestCase):
             token = created["invite_url"].split("token=", 1)[1]
             result = asyncio.run(accept(token, {"tenant_key": "second", "app_id": "cli_second", "app_secret": "secret_second", "redirect_uris": [LOCAL_CALLBACK]}))
         self.assertEqual(result["tenant"]["name"], "第二企业")
+        self.assertEqual(result["initial_sync"], {"name": "第二企业", "departments": 1, "members": 1})
         self.assertEqual(result["login_url"], "/")
         self.assertTrue(service.tenant_exists("second"))
+        service.sync_tenant_profile.assert_awaited_once_with("second", force=True, strict=True)
+        service.sync_directory.assert_awaited_once_with("second")
+
+    def test_tenant_onboarding_rolls_back_when_initial_member_sync_fails(self):
+        service = AuthService(AuthSettings(
+            app_id="cli_default", app_secret="secret_default", redirect_uri=LOCAL_CALLBACK,
+            redirect_uris=[LOCAL_CALLBACK], session_secret="test-secret", super_admin_ids=["ou_admin"],
+            cookie_secure=False, default_role="member", db_path=":memory:",
+            tenants={"default": {"tenant_key": "default", "name": "默认企业", "app_id": "cli_default", "app_secret": "secret_default", "redirect_uris": [LOCAL_CALLBACK], "enabled": True}},
+        ))
+        service.verify_tenant_connection = AsyncMock(return_value={"verified": True, "enterprise_name": "第二企业"})
+        service.sync_tenant_profile = AsyncMock(return_value={"tenant_key": "second", "name": "第二企业"})
+        service.sync_directory = AsyncMock(side_effect=FeishuAPIError("缺少 contact:user.base:readonly"))
+        invitation = service.store.create_tenant_invitation("第二企业", 600)
+        app = FastAPI()
+        register_auth(app, service)
+        accept = endpoint(app, "/api/tenant-invitations/{token}/accept", "POST")
+
+        with patch("fy_auth._persist_tenant_configs"):
+            with self.assertRaises(HTTPException) as error:
+                asyncio.run(accept(invitation["token"], {
+                    "tenant_key": "second", "app_id": "cli_second", "app_secret": "secret_second",
+                    "redirect_uris": [LOCAL_CALLBACK],
+                }))
+
+        self.assertEqual(error.exception.status_code, 502)
+        self.assertIn("同步成员失败", error.exception.detail)
+        self.assertIn("contact:user.base:readonly", error.exception.detail)
+        self.assertFalse(service.tenant_exists("second"))
+        self.assertFalse(service.store.tenant_invitation(invitation["token"])["used"])
 
     def test_resolve_profile_restores_department_ids_from_local_member(self):
         service = AuthService(settings(db_path=":memory:"))

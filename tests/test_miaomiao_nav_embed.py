@@ -24,7 +24,8 @@ class MiaomiaoNavEmbedTests(unittest.TestCase):
         self.assertRegex(self.source, r"const PAGE_IDS = \[[^\]]*'miao-nav'")
 
     def test_page_title_and_translation_are_present(self):
-        self.assertIn("document.title = id === 'miao-nav' ? '画忆的妙妙屋导航' : '扶摇AI Studio';", self.source)
+        self.assertIn("document.title = menuName ? `棱镜 - ${menuName}` : '棱镜';", self.source)
+        self.assertIn("updateDocumentTitle(document.querySelector('.nav-item.active, .side-pill.active'));", self.source)
         self.assertIn('"nav.miaoNav": { zh: "妙妙屋导航", en: "MiaoMiao Navigation" }', self.common_i18n)
 
     def test_menu_is_first_navigation_entry(self):

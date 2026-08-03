@@ -5,7 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="icon" href="/static/images/logo.png" type="image/png">
-    <title>扶摇AI Studio</title>
+    <title>棱镜</title>
     <style>
         html.studio-route-booting body {
             visibility: hidden !important;
@@ -1815,7 +1815,7 @@
             <iframe id="frame-asset-manager" data-src="/static/asset-manager.html?v=2026.08.01.1785591091" scrolling="yes"></iframe>
             <iframe id="frame-api-settings" data-src="/static/api-settings.html?v=2026.08.01.1785609116" scrolling="yes"></iframe>
             <iframe id="frame-comfyui-settings" data-src="/static/comfyui-settings.html?v=2026.08.01.1785609116" scrolling="yes"></iframe>
-                <iframe id="frame-org-permissions" data-src="/static/org-permissions.html?v=2026.08.01.1785695481" scrolling="yes"></iframe>
+                <iframe id="frame-org-permissions" data-src="/static/org-permissions.html?v=2026.08.03.6" scrolling="yes"></iframe>
             <iframe id="frame-canvas" data-src="/static/canvas-list.html?v=2026.08.01.1785609116" scrolling="yes"></iframe>
 
         </main>
@@ -1961,9 +1961,23 @@
             return PAGE_IDS.includes(id) && hasPermission(PAGE_PERMISSIONS[id]) && (LOCAL_FEATURE_ENABLED || !LOCAL_PAGE_IDS.includes(id));
         }
 
+        function getNavigationLabel(trigger, id) {
+            const label = trigger?.querySelector('.nav-text, .side-pill-text');
+            const text = label?.textContent?.trim();
+            if (text) return text;
+            if (id === 'miao-nav') return '妙妙屋导航';
+            return '';
+        }
+
+        function updateDocumentTitle(trigger, id) {
+            const menuName = getNavigationLabel(trigger, id);
+            document.title = menuName ? `棱镜 - ${menuName}` : '棱镜';
+        }
+
         function markExternalNavActive(trigger) {
             document.querySelectorAll('.nav-item,.side-pill').forEach(node => node.classList.remove('active'));
             trigger?.classList.add('active');
+            updateDocumentTitle(trigger);
         }
 
         function applyAccessProfile() {
@@ -2146,7 +2160,7 @@
         function switchUI(el, id, options = {}) {
             resetStudioRootScroll();
             if(!canAccessPage(id)) id = DEFAULT_PAGE_ID;
-            document.title = id === 'miao-nav' ? '画忆的妙妙屋导航' : '扶摇AI Studio';
+            updateDocumentTitle(el, id);
             document.querySelectorAll('.nav-item,.side-pill').forEach(n => n.classList.remove('active'));
             if(el) el.classList.add('active');
             document.querySelectorAll('iframe').forEach(f => f.classList.remove('active'));
@@ -2358,6 +2372,7 @@
         function toggleLanguage() {
             if(!window.StudioI18n) return;
             window.StudioI18n.toggle();
+            updateDocumentTitle(document.querySelector('.nav-item.active, .side-pill.active'));
             document.querySelectorAll('iframe').forEach(frame => syncLanguageToFrame(frame));
             updateProjectUpdateTitle();
             refreshUpdateButtonText();
