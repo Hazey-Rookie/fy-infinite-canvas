@@ -133,9 +133,9 @@ class HighResolutionLazyLoadContractTests(unittest.TestCase):
             version = handle.read().strip()
         with open(os.path.join(ROOT, "static", "update-notes.json"), encoding="utf-8") as handle:
             notes = json.load(handle)
-        self.assertEqual(version, "2026.08.01")
+        self.assertEqual(version, "2026.08.04")
         self.assertEqual(notes["version"], version)
-        self.assertEqual(len(notes["items"]), 4)
+        self.assertEqual(len(notes["items"]), 1)
 
 
 if __name__ == "__main__":
