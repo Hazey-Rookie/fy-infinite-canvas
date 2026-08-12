@@ -497,7 +497,7 @@ function smartMediaPreviewUrl(itemOrUrl, size=512){
 function smartPreviewImgHtml(itemOrUrl, size=512, attrs=''){
     const original = smartOriginalMediaUrl(itemOrUrl);
     const preview = smartMediaPreviewUrl(itemOrUrl, size);
-    return `<img src="${escapeHtml(preview)}" data-preview-src="${escapeAttr(preview)}" data-original-src="${escapeAttr(original)}"${attrs ? ` ${attrs}` : ''}>`;
+    return `<img loading="lazy" decoding="async" src="${escapeHtml(preview)}" data-preview-src="${escapeAttr(preview)}" data-original-src="${escapeAttr(original)}"${attrs ? ` ${attrs}` : ''}>`;
 }
 function loadSmartOriginalImageDimensions(url){
     const src = displayMediaUrl({url:smartOriginalMediaUrl(url)});
@@ -581,6 +581,16 @@ function bindSmartPreviewImageFallbacks(root=document){
                 img.replaceWith(tpl.content.firstElementChild);
                 return;
             }
+            let localMedia = false;
+            try {
+                const pathname = new URL(original, window.location.origin).pathname;
+                localMedia = pathname.startsWith('/assets/') || pathname.startsWith('/output/') || pathname.startsWith('/api/storage-files/');
+            } catch(e) {}
+            if(localMedia){
+                img.dataset.previewFailed = '1';
+                img.removeAttribute('src');
+                return;
+            }
             if(original && img.getAttribute('src') !== original) img.src = original;
         });
     });
@@ -653,6 +663,13 @@ function syncSmartSelectedImageResolution(root=null){
                 if(preview && img.getAttribute('src') !== preview) img.src = preview;
                 return;
             }
+            try {
+                const pathname = new URL(original, window.location.origin).pathname;
+                if(pathname.startsWith('/assets/') || pathname.startsWith('/output/') || pathname.startsWith('/api/storage-files/')){
+                    if(preview && img.getAttribute('src') !== preview) img.src = preview;
+                    return;
+                }
+            } catch(e) {}
             const target = displayMediaUrl({url:smartOriginalMediaUrl(original)});
             if(!target) return;
             img.dataset.selectedHighResTarget = target;
@@ -7027,6 +7044,15 @@ function bindImageProxyFallback(imgEl, itemOrUrl){
     imgEl.dataset.proxyFallbackBound = '1';
     imgEl.addEventListener('error', () => {
         if(imgEl.dataset.proxyFallbackTried === '1') return;
+        const raw = smartOriginalMediaUrl(itemOrUrl);
+        try {
+            const pathname = new URL(raw, window.location.origin).pathname;
+            if(pathname.startsWith('/assets/') || pathname.startsWith('/output/') || pathname.startsWith('/api/storage-files/')){
+                imgEl.dataset.previewFailed = '1';
+                imgEl.removeAttribute('src');
+                return;
+            }
+        } catch(e) {}
         const fallback = proxiedMediaUrl(itemOrUrl);
         if(!fallback || fallback === imgEl.getAttribute('src')) return;
         imgEl.dataset.proxyFallbackTried = '1';
@@ -7067,9 +7093,10 @@ function downloadPreviewImage(){
     const node = nodes.find(n => n.id === previewNavState.nodeId);
     const image = node?.images?.[previewNavState.index];
     if(!image?.url) return;
-    const name = downloadNameForMediaItem(image, 'image');
+    const downloadItem = {...image, url:image.original_url || image.originalUrl || image.url};
+    const name = downloadNameForMediaItem(downloadItem, 'image');
     const link = document.createElement('a');
-    link.href = `/api/download-output?url=${encodeURIComponent(image.url)}&name=${encodeURIComponent(name)}`;
+    link.href = `/api/download-output?url=${encodeURIComponent(downloadItem.url)}&name=${encodeURIComponent(name)}`;
     link.download = name;
     document.body.appendChild(link);
     link.click();
@@ -7077,9 +7104,10 @@ function downloadPreviewImage(){
 }
 function downloadPreviewFile(item){
     if(!item?.url) return;
-    const name = downloadNameForMediaItem(item, 'output');
+    const downloadItem = {...item, url:item.original_url || item.originalUrl || item.url};
+    const name = downloadNameForMediaItem(downloadItem, 'output');
     const link = document.createElement('a');
-    link.href = `/api/download-output?url=${encodeURIComponent(item.url)}&name=${encodeURIComponent(name)}`;
+    link.href = `/api/download-output?url=${encodeURIComponent(downloadItem.url)}&name=${encodeURIComponent(name)}`;
     link.download = name;
     document.body.appendChild(link);
     link.click();
@@ -8731,28 +8759,6 @@ function measureSmartNodeImages(){
         if(!node || !image || image.natural_w || image.natural_h) return;
         const isPreview = isSmartPreviewImage(imgEl);
         const originalSrc = imgEl.dataset?.originalSrc || image.url || '';
-        if(isPreview && imgEl.dataset?.previewKind !== 'video' && originalSrc && !image._naturalSizeLoading){
-            image._naturalSizeLoading = true;
-            loadSmartOriginalImageDimensions(originalSrc).then(size => {
-                image._naturalSizeLoading = false;
-                if(!size || image.natural_w || image.natural_h) return;
-                image.natural_w = size.w;
-                image.natural_h = size.h;
-                delete image.layout_w;
-                delete image.layout_h;
-                applyThumbDisplaySizeToElement(itemEl, image, Math.max(itemEl?.clientWidth || 0, itemEl?.clientHeight || 0));
-                updateImageResolutionBadgeElement(itemEl, image);
-                if(!isSmartGroupNode(node) && (node.images || []).length === 1 && !node.w && !node.h){
-                    const layout = singleImageLayout(image, node, mediaNodeDefaultScale(node));
-                    node.w = layout.width;
-                    node.h = layout.height;
-                }
-                updateNodeElementDuringResize(node);
-                if(containerNode && containerNode.id !== node.id) updateNodeElementDuringResize(containerNode);
-                if(isNodeSelected(node.id)) updateComposer();
-                scheduleSave();
-            });
-        }
         if(isPreview && image.layout_w && image.layout_h) return;
         const apply = () => {
             const w = imgEl.naturalWidth || imgEl.videoWidth || 0;

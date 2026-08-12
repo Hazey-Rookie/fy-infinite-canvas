@@ -126,6 +126,17 @@ function bindCanvasPreviewImageFallbacks(root=document){
                 img.replaceWith(video.content.firstElementChild);
                 return;
             }
+            // 本地原图可能是超大像素图；预览失败时不要回退到原图，避免再次触发数亿像素解码。
+            let localMedia = false;
+            try {
+                const pathname = new URL(original, window.location.origin).pathname;
+                localMedia = pathname.startsWith('/assets/') || pathname.startsWith('/output/') || pathname.startsWith('/api/storage-files/');
+            } catch(e) {}
+            if(localMedia){
+                img.dataset.previewFailed = '1';
+                img.removeAttribute('src');
+                return;
+            }
             if(original && img.getAttribute('src') !== original) img.src = original;
         });
     });
@@ -169,6 +180,14 @@ function syncCanvasSelectedImageResolution(root=nodesEl){
             if(preview && img.getAttribute('src') !== preview) img.src = preview;
             return;
         }
+        // 画布内本地资源统一使用缩略图；原图只在图片编辑器中按需加载。
+        try {
+            const pathname = new URL(original, window.location.origin).pathname;
+            if(pathname.startsWith('/assets/') || pathname.startsWith('/output/') || pathname.startsWith('/api/storage-files/')){
+                if(preview && img.getAttribute('src') !== preview) img.src = preview;
+                return;
+            }
+        } catch(e) {}
         const target = canvasDisplayMediaUrl(original);
         if(!target) return;
         img.dataset.selectedHighResTarget = target;
@@ -4037,6 +4056,7 @@ async function uploadMediaFiles(files, point, onlyImages=false, opts={}){
             x:base.x + i * 36,
             y:base.y + i * 36,
             url:file.url,
+            original_url:file.original_url || file.originalUrl || '',
             name:file.name,
             mediaKind:kind
         };
@@ -4073,7 +4093,7 @@ async function createImageCardsFromLocalPaths(paths, point){
         const base = point || screenToWorld(window.innerWidth / 2, window.innerHeight / 2);
         const created = [];
         files.forEach((file, i) => {
-            const node = {id:uid('img'), type:'image', x:base.x + i * 36, y:base.y + i * 36, url:file.url, name:file.name, mediaKind:'image'};
+            const node = {id:uid('img'), type:'image', x:base.x + i * 36, y:base.y + i * 36, url:file.url, original_url:file.original_url || file.originalUrl || '', name:file.name, mediaKind:'image'};
             nodes.push(node);
             created.push(node);
         });
@@ -4198,6 +4218,7 @@ async function fillImageNode(nodeId, files, opts={}){
     const node = nodes.find(n => n.id === nodeId);
     if(file && node){
         node.url = file.url;
+        node.original_url = file.original_url || file.originalUrl || '';
         node.name = file.name;
         node.mediaKind = file.kind || mediaKindForUpload(imgs[0]);
         render();
@@ -5926,6 +5947,19 @@ function measureCanvasOriginalImageNodes(root=nodesEl){
         const nodeEl = imgEl.closest('.image-node');
         const node = nodes.find(n => n.id === nodeEl?.dataset.id);
         if(!node || node.type !== 'image' || !node.url || node.natural_w || node.natural_h || node._naturalSizeLoading) return;
+        // 画布节点使用 /api/media-preview 缩略图展示。不要再加载原图来测量尺寸，
+        // 否则超大全景图会在浏览器里解码数亿像素，导致整个画布卡顿。
+        if(isCanvasPreviewImage(imgEl)){
+            const applyPreviewSize = () => {
+                if(node.natural_w || node.natural_h || !imgEl.naturalWidth || !imgEl.naturalHeight) return;
+                node.natural_w = imgEl.naturalWidth;
+                node.natural_h = imgEl.naturalHeight;
+                scheduleSave();
+            };
+            if(imgEl.complete) applyPreviewSize();
+            else imgEl.addEventListener('load', applyPreviewSize, {once:true});
+            return;
+        }
         const original = imgEl.dataset.originalSrc || node.url;
         if(!original) return;
         node._naturalSizeLoading = true;

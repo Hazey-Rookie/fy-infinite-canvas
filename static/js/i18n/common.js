@@ -26,6 +26,7 @@
         "nav.localTools": { zh: "本地功能", en: "Local Tools" },
         "nav.threeDTools": { zh: "3D功能", en: "3D Tools" },
         "nav.tripo3d": { zh: "Tripo3d", en: "Tripo3d" },
+        "nav.rodin": { zh: "Rodin", en: "Rodin" },
         "nav.miaoNav": { zh: "妙妙屋导航", en: "MiaoMiao Navigation" },
         "nav.enhance": { zh: "细节增强", en: "Enhance" },
         "nav.imageEdit": { zh: "图片编辑", en: "Image Edit" },

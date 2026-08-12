@@ -258,6 +258,11 @@ GLOBAL_CONFIG_FILE = os.path.join(BASE_DIR, "global_config.json")
 CANVAS_TRASH_RETENTION_MS = 30 * 24 * 60 * 60 * 1000
 LOCAL_IMAGE_IMPORT_MAX_BYTES = int(os.getenv("LOCAL_IMAGE_IMPORT_MAX_BYTES", str(50 * 1024 * 1024)))
 LOCAL_IMAGE_IMPORT_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+# 无限画布不需要把超大原图带进浏览器。超过任一阈值时，上传后自动生成适合画布/参考图的副本。
+CANVAS_IMAGE_OPTIMIZE_BYTES = int(os.getenv("CANVAS_IMAGE_OPTIMIZE_BYTES", str(30 * 1024 * 1024)))
+CANVAS_IMAGE_MAX_PIXELS = int(os.getenv("CANVAS_IMAGE_MAX_PIXELS", str(24_000_000)))
+CANVAS_IMAGE_MAX_EDGE = int(os.getenv("CANVAS_IMAGE_MAX_EDGE", "8192"))
+CANVAS_IMAGE_PREPARE_LOCK = Lock()
 RUNNINGHUB_THUMBNAIL_EXTS = (".jpg",)
 STORAGE_SETTINGS_FILE = os.path.join(DATA_DIR, "storage_settings.json")
 DEFAULT_STORAGE_DIRS = {
@@ -3596,7 +3601,7 @@ def canvas_asset_url_value(value):
     if isinstance(value, str):
         return value.strip()
     if isinstance(value, dict):
-        for key in ("url", "path", "src", "uri", "output", "output_url", "outputUrl", "video", "video_url", "videoUrl"):
+        for key in ("original_url", "originalUrl", "url", "path", "src", "uri", "output", "output_url", "outputUrl", "video", "video_url", "videoUrl"):
             text = str(value.get(key) or "").strip()
             if text:
                 return text
@@ -3605,6 +3610,16 @@ def canvas_asset_url_value(value):
 def canvas_asset_downloadable_url(url):
     text = str(url or "").strip()
     return text if text.startswith(("/output/", "/assets/", "http://", "https://")) else ""
+
+def original_path_for_optimized_asset(path):
+    """Return the retained full-resolution sibling for an optimized upload, when present."""
+    if not path or not os.path.isfile(path):
+        return path
+    stem, ext = os.path.splitext(path)
+    if not stem.endswith("_optimized"):
+        return path
+    original = stem[:-len("_optimized")] + ext
+    return original if os.path.isfile(original) else path
 
 def canvas_asset_kind(value, url=""):
     explicit = ""
@@ -7220,6 +7235,19 @@ async def media_preview(url: str, w: int = 512):
     if not path or not os.path.isfile(path):
         raise HTTPException(status_code=404, detail="媒体文件不存在")
 
+    # 兼容修复前已保存到画布的超大输入图：首次请求预览时迁移成轻量副本，
+    # 避免旧节点继续触发 Pillow/浏览器对数亿像素原图的解码。
+    try:
+        in_root = os.path.abspath(OUTPUT_INPUT_DIR)
+        if os.path.commonpath([in_root, os.path.abspath(path)]) == in_root and os.path.getsize(path) > CANVAS_IMAGE_OPTIMIZE_BYTES:
+            _migrated_name, migrated_path, migrated = await asyncio.to_thread(
+                prepare_canvas_image_file, path, os.path.basename(path)
+            )
+            if migrated:
+                path = migrated_path
+    except (OSError, ValueError):
+        pass
+
     width = max(64, min(2048, int(w or 512)))
     webp_path, png_path = media_preview_cache_paths(path, width)
 
@@ -7369,6 +7397,52 @@ def normalize_local_image_path(value):
         return os.path.abspath(path)
     raise HTTPException(status_code=400, detail="只支持本机绝对图片路径")
 
+def prepare_canvas_image_file(path, filename):
+    """校验画布图片，并在像素/文件过大时写出轻量副本，避免浏览器解码超大原图。"""
+    file_size = os.path.getsize(path)
+    optimized = False
+    CANVAS_IMAGE_PREPARE_LOCK.acquire()
+    old_limit = Image.MAX_IMAGE_PIXELS
+    # Pillow 默认会拒绝极宽全景图；这里先读取尺寸，再按项目阈值安全降采样。
+    Image.MAX_IMAGE_PIXELS = None
+    try:
+        with Image.open(path) as source:
+            width, height = source.size
+            pixels = int(width) * int(height)
+            needs_resize = (
+                file_size > CANVAS_IMAGE_OPTIMIZE_BYTES
+                or pixels > CANVAS_IMAGE_MAX_PIXELS
+                or max(width, height) > CANVAS_IMAGE_MAX_EDGE
+            )
+            if not needs_resize:
+                source.verify()
+                return filename, path, False
+
+            image = ImageOps.exif_transpose(source)
+            scale = min(
+                1.0,
+                CANVAS_IMAGE_MAX_EDGE / max(image.width, image.height),
+                (CANVAS_IMAGE_MAX_PIXELS / max(1, image.width * image.height)) ** 0.5,
+            )
+            if scale < 1:
+                image = image.resize(
+                    (max(1, round(image.width * scale)), max(1, round(image.height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+            has_alpha = image_has_alpha(image)
+            output_ext = ".png" if has_alpha else ".jpg"
+            output_filename = f"{os.path.splitext(filename or 'image')[0]}_optimized{output_ext}"
+            output_path = output_path_for(output_filename, "input")
+            if has_alpha:
+                image.convert("RGBA").save(output_path, format="PNG", optimize=True)
+            else:
+                image.convert("RGB").save(output_path, format="JPEG", quality=88, optimize=True, progressive=True)
+            optimized = True
+    finally:
+        Image.MAX_IMAGE_PIXELS = old_limit
+        CANVAS_IMAGE_PREPARE_LOCK.release()
+    return output_filename, output_path, optimized
+
 def import_local_image_file(path):
     ext = os.path.splitext(path)[1].lower()
     if ext not in LOCAL_IMAGE_IMPORT_EXTS:
@@ -7383,18 +7457,28 @@ def import_local_image_file(path):
         raise HTTPException(status_code=400, detail="本地图片为空")
     if size > LOCAL_IMAGE_IMPORT_MAX_BYTES:
         raise HTTPException(status_code=413, detail="本地图片过大，请使用 50MB 以内的图片")
-    try:
-        with Image.open(path) as img:
-            img.verify()
-    except Exception:
-        raise HTTPException(status_code=400, detail="文件不是可识别的图片")
     filename = f"ai_ref_{uuid.uuid4().hex[:12]}{ext}"
+    original_filename = filename
     dest = output_path_for(filename, "input")
     try:
         shutil.copyfile(path, dest)
     except OSError:
         raise HTTPException(status_code=500, detail="导入本地图片失败")
-    return {"url": output_url_for(filename, "input"), "name": os.path.basename(path) or filename, "kind": "image"}
+    try:
+        filename, dest, optimized = prepare_canvas_image_file(dest, filename)
+    except Exception:
+        try:
+            os.unlink(dest)
+        except OSError:
+            pass
+        raise HTTPException(status_code=400, detail="文件不是可识别的图片")
+    return {
+        "url": output_url_for(filename, "input"),
+        "original_url": output_url_for(original_filename, "input") if optimized else "",
+        "name": os.path.basename(path) or filename,
+        "kind": "image",
+        "optimized": optimized,
+    }
 
 def default_asset_library():
     categories = [
@@ -11975,6 +12059,10 @@ def download_output(request: Request, url: str, name: str = "", inline: bool = F
     if not path:
         path = local_media_file_by_basename(filename_from_media_url(url, ""))
     if path:
+        original_path = original_path_for_optimized_asset(path)
+        if not name or (os.path.basename(path).lower().endswith("_optimized" + os.path.splitext(path)[1].lower()) and str(name).lower().startswith("ai_ref_")):
+            name = os.path.basename(original_path)
+        path = original_path
         filename = sanitize_export_filename(os.path.basename(name) if name else os.path.basename(path), os.path.basename(path))
         return FileResponse(path, media_type=content_type_for_path(path), filename=None if inline else filename)
     # 远程文件：流式代理，绝不把整段视频/大文件读进内存（否则多个视频同时代理会撑爆内存、拖垮单进程服务）。
@@ -12201,10 +12289,22 @@ async def upload_ai_reference(files: List[UploadFile] = File(...)):
             if not ext:
                 ext = ".bin"
         filename = f"ai_ref_{uuid.uuid4().hex[:12]}{ext}"
+        original_filename = filename
         path = output_path_for(filename, "input")
         with open(path, "wb") as f:
             f.write(content)
-        uploaded.append({"url": output_url_for(filename, "input"), "name": file.filename or filename, "kind": kind, "mime": content_type})
+        if kind == "image":
+            try:
+                filename, path, optimized = await asyncio.to_thread(prepare_canvas_image_file, path, filename)
+            except Exception:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                raise HTTPException(status_code=415, detail=f"{file.filename or '文件'} 不是可识别的图片")
+        else:
+            optimized = False
+        uploaded.append({"url": output_url_for(filename, "input"), "original_url": output_url_for(original_filename, "input") if optimized else "", "name": file.filename or filename, "kind": kind, "mime": content_type, "optimized": optimized})
     return {"files": uploaded}
 
 class Base64UploadRequest(BaseModel):
@@ -12892,7 +12992,11 @@ async def import_local_ai_reference(payload: LocalImageImportRequest, request: R
     requested = [p for p in requested if str(p or "").strip()][:20]
     if not requested:
         raise HTTPException(status_code=400, detail="没有可导入的本地图片")
-    return {"files": [import_local_image_file(normalize_local_image_path(path)) for path in requested]}
+    files = []
+    for path in requested:
+        local_path = normalize_local_image_path(path)
+        files.append(await asyncio.to_thread(import_local_image_file, local_path))
+    return {"files": files}
 
 @app.get("/api/runninghub/app-info")
 async def runninghub_app_info(webappId: str = ""):
@@ -16741,6 +16845,10 @@ async def download_canvas_assets(payload: CanvasAssetDownloadRequest):
             content = None
             content_type = ""
             if path and os.path.isfile(path):
+                was_optimized = os.path.basename(path).lower().endswith("_optimized" + os.path.splitext(path)[1].lower())
+                path = original_path_for_optimized_asset(path)
+                if was_optimized and requested_name.lower().startswith("ai_ref_"):
+                    requested_name = ""
                 base = sanitize_export_filename(requested_name or os.path.basename(path), os.path.basename(path) or f"image-{count + 1}.png")
             else:
                 local_by_name = local_media_file_by_basename(filename_from_media_url(text, ""))
