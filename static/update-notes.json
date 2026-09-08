@@ -1,10 +1,14 @@
 {
-  "version": "2026.08.04",
-  "updated_at": "2026-08-04T23:32:36+08:00",
+  "version": "2026.08.28",
+  "updated_at": "2026-08-30T00:00:00+08:00",
   "items": [
     {
       "type": "feature",
       "text": "适配本地 ComfyUI 和 RunningHub 调用 MiniMax H3，并加入对应工作流与 API 预设。"
+    },
+    {
+      "type": "compatibility",
+      "text": "兼容上游 2026.08.28 版本的画布节点、媒体处理与模型参数更新，并保留扶摇多租户登录与本地配置。"
     }
   ]
 }

@@ -1270,6 +1270,8 @@ def normalize_provider(item):
     if base_url and not re.match(r"^https?://", base_url):
         raise HTTPException(status_code=400, detail=f"{name} 的 Base URL 需要以 http:// 或 https:// 开头")
     protocol = str(item.get("protocol") or "openai").strip().lower()
+    if protocol == "tudou":
+        protocol = "openai"
     if protocol not in SUPPORTED_PROVIDER_PROTOCOLS:
         protocol = "openai"
     image_request_mode = detect_image_request_mode(base_url, item.get("image_models") or []) or normalize_image_request_mode(item.get("image_request_mode"))
@@ -1340,6 +1342,86 @@ def save_api_providers(providers):
             f.flush()
             os.fsync(f.fileno())
         os.replace(temp_path, API_PROVIDERS_FILE)
+
+def default_runninghub_static_provider():
+    return {
+        "id": "runninghub",
+        "name": "RunningHub",
+        "base_url": RUNNINGHUB_DEFAULT_BASE_URL,
+        "protocol": "runninghub",
+        "image_generation_endpoint": "",
+        "image_edit_endpoint": "",
+        "enabled": True,
+        "primary": False,
+        "image_models": [],
+        "chat_models": [],
+        "video_models": [],
+        "model_protocols": {},
+        "ms_loras": [],
+        "ms_defaults_version": 0,
+        "rh_apps": [],
+        "rh_workflows": [],
+    }
+
+def mutate_static_runninghub_provider(mutator):
+    os.makedirs(STATIC_RUNNINGHUB_DIR, exist_ok=True)
+    raw = []
+    if os.path.exists(STATIC_RUNNINGHUB_API_PROVIDERS_FILE):
+        try:
+            with open(STATIC_RUNNINGHUB_API_PROVIDERS_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception as exc:
+            print(f"读取 static RunningHub 模板失败，将重建基础模板: {exc}")
+            raw = []
+    if isinstance(raw, dict) and str(raw.get("id") or "").strip().lower() == "runninghub":
+        provider = raw
+    else:
+        if isinstance(raw, list):
+            providers = raw
+        elif isinstance(raw, dict):
+            providers = raw.setdefault("providers", [])
+            if not isinstance(providers, list):
+                providers = []
+                raw["providers"] = providers
+        else:
+            raw = []
+            providers = raw
+        provider = next((
+            item for item in providers
+            if isinstance(item, dict) and str(item.get("id") or "").strip().lower() == "runninghub"
+        ), None)
+        if provider is None:
+            provider = default_runninghub_static_provider()
+            providers.append(provider)
+    changed = mutator(provider)
+    if changed is False:
+        return False
+    with open(STATIC_RUNNINGHUB_API_PROVIDERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    return True
+
+def sync_runninghub_provider_workflows_to_static_template(provider):
+    if not isinstance(provider, dict) or str(provider.get("id") or "").strip().lower() != "runninghub":
+        return False
+    workflows = []
+    seen = set()
+    for entry in normalize_runninghub_entries(provider.get("rh_workflows") or [], "workflow"):
+        key = runninghub_workflow_store_key(entry.get("workflowId") or entry.get("id"))
+        if not key or entry.get("hidden") is True or key in seen:
+            continue
+        seen.add(key)
+        workflows.append(entry)
+    def apply_workflows(static_provider):
+        static_provider["id"] = "runninghub"
+        static_provider["name"] = static_provider.get("name") or "RunningHub"
+        static_provider["base_url"] = static_provider.get("base_url") or RUNNINGHUB_DEFAULT_BASE_URL
+        static_provider["protocol"] = "runninghub"
+        static_provider["rh_workflows"] = workflows
+        if "rh_apps" not in static_provider or not isinstance(static_provider.get("rh_apps"), list):
+            static_provider["rh_apps"] = []
+        return True
+    return mutate_static_runninghub_provider(apply_workflows)
 
 def default_runninghub_static_provider():
     return {
@@ -2340,6 +2422,153 @@ def stage_update_from_source(source: str, staging_root: str) -> Tuple[List[str],
     download_github_update_files(files, staging_root)
     return root_files, static_files, files
 
+def validate_staged_update(staging_root: str, root_files: List[str], static_files: List[str]) -> None:
+    """Reject incomplete or syntactically invalid downloads before touching live code."""
+    main_path = os.path.join(staging_root, "main.py")
+    version_path = os.path.join(staging_root, "VERSION")
+    if not os.path.isfile(main_path) or not os.path.isfile(version_path):
+        raise RuntimeError("更新暂存缺少 main.py 或 VERSION")
+    with open(main_path, "rb") as f:
+        compile(f.read(), main_path, "exec")
+    with open(version_path, "r", encoding="utf-8") as f:
+        version = (f.read().strip().splitlines() or [""])[0].strip()
+    if not version or len(version) > 80 or any(ch in version for ch in "<>\\r\\n"):
+        raise RuntimeError("更新暂存的 VERSION 格式异常")
+    for rel in list(root_files or []) + list(static_files or []):
+        safe_update_target(rel)
+        staged_path = os.path.join(staging_root, *str(rel).replace("\\", "/").split("/"))
+        if not os.path.isfile(staged_path):
+            raise RuntimeError(f"更新暂存缺少文件：{rel}")
+
+UPDATE_BACKUP_MANIFEST = "manifest.json"
+UPDATE_BACKUP_FORMAT = 2
+UPDATE_BACKUP_RETENTION = 10
+
+def update_backup_root() -> str:
+    return os.path.abspath(os.path.join(DATA_DIR, "update_backups"))
+
+def next_update_backup_dir(prefix: str = "") -> str:
+    root = update_backup_root()
+    os.makedirs(root, exist_ok=True)
+    base = f"{prefix}{time.strftime('%Y%m%d-%H%M%S')}"
+    candidate = os.path.join(root, base)
+    suffix = 2
+    while os.path.exists(candidate):
+        candidate = os.path.join(root, f"{base}-{suffix}")
+        suffix += 1
+    return candidate
+
+def update_backup_manifest_path(backup_dir: str) -> str:
+    return os.path.join(backup_dir, UPDATE_BACKUP_MANIFEST)
+
+def read_update_backup_manifest(backup_dir: str) -> Dict[str, Any]:
+    try:
+        with open(update_backup_manifest_path(backup_dir), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def write_update_backup_manifest(backup_dir: str, payload: Dict[str, Any]) -> None:
+    path = update_backup_manifest_path(backup_dir)
+    temp_path = f"{path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(temp_path, path)
+
+def count_regular_files(path: str) -> int:
+    return sum(len(files) for _, _, files in os.walk(path)) if os.path.isdir(path) else 0
+
+def prune_update_backups(keep_names: Optional[set] = None) -> List[str]:
+    """Keep the newest restore points while never deleting an active protected point."""
+    keep_names = {str(name) for name in (keep_names or set()) if str(name)}
+    backups = sorted(list_update_backups(), key=lambda item: float(item.get("created_at") or 0), reverse=True)
+    selected_names = []
+    for item in backups:
+        name = str(item.get("name") or "")
+        if name in keep_names and name not in selected_names:
+            selected_names.append(name)
+    for item in backups:
+        name = str(item.get("name") or "")
+        if len(selected_names) >= UPDATE_BACKUP_RETENTION:
+            break
+        if name and name not in selected_names:
+            selected_names.append(name)
+    selected = set(selected_names)
+    removed: List[str] = []
+    for item in backups:
+        name = str(item.get("name") or "")
+        if name in selected:
+            continue
+        path = os.path.join(update_backup_root(), name)
+        try:
+            shutil.rmtree(path)
+            removed.append(name)
+        except OSError as exc:
+            print(f"[update] 清理旧恢复点失败 {name}: {exc}")
+    return removed
+
+def create_update_backup(
+    backup_dir: str,
+    root_files: List[str],
+    static_files: List[str],
+    *,
+    kind: str,
+    source: str = "",
+    target_version: str = "",
+    parent_backup: str = "",
+    update_notes: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Create a complete, self-describing restore point before replacing update payloads."""
+    backup_root_abs = update_backup_root()
+    backup_dir = os.path.abspath(backup_dir)
+    if os.path.commonpath([backup_root_abs, backup_dir]) != backup_root_abs:
+        raise ValueError("备份路径不安全")
+    if os.path.exists(backup_dir):
+        raise FileExistsError("备份目录已存在")
+    clean_root_files = sorted({str(item or "").replace("\\", "/") for item in root_files if update_allowed_file(item) and not str(item).startswith("static/")})
+    clean_static_files = sorted({str(item or "").replace("\\", "/") for item in static_files if str(item).startswith("static/") and update_allowed_file(item)})
+    manifest: Dict[str, Any] = {
+        "format": UPDATE_BACKUP_FORMAT,
+        "state": "creating",
+        "kind": kind,
+        "created_at": time.time(),
+        "from_version": current_app_version(),
+        "target_version": str(target_version or "").strip(),
+        "source": str(source or "").strip(),
+        "parent_backup": str(parent_backup or "").strip(),
+        "update_notes": safe_update_notes(update_notes or {}, str(target_version or "").strip()),
+        "root_files": {},
+        "static_snapshot": {"exists": False, "file_count": 0},
+        "affected_files": clean_root_files + clean_static_files,
+    }
+    try:
+        os.makedirs(backup_dir, exist_ok=False)
+        write_update_backup_manifest(backup_dir, manifest)
+        for rel in clean_root_files:
+            target = safe_update_target(rel)
+            existed = os.path.isfile(target)
+            manifest["root_files"][rel] = {"existed": existed}
+            if existed:
+                backup_path = os.path.join(backup_dir, *rel.split("/"))
+                os.makedirs(os.path.dirname(backup_path), exist_ok=True)
+                shutil.copy2(target, backup_path)
+        static_dir = safe_static_dir()
+        if os.path.isdir(static_dir):
+            backup_static_dir = os.path.join(backup_dir, "static")
+            shutil.copytree(static_dir, backup_static_dir)
+            manifest["static_snapshot"] = {
+                "exists": True,
+                "file_count": count_regular_files(backup_static_dir),
+            }
+        manifest["state"] = "ready"
+        write_update_backup_manifest(backup_dir, manifest)
+        return manifest
+    except Exception:
+        if os.path.isdir(backup_dir):
+            shutil.rmtree(backup_dir, ignore_errors=True)
+        raise
+
 @app.post("/api/update-from-github")
 def update_from_github(req: UpdateRequest = UpdateRequest()):
     if not UPDATE_LOCK.acquire(blocking=False):
@@ -2352,7 +2581,8 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
         other = "modelscope" if requested_source == "github" else "github"
         source_order.append(other)
     try:
-        backup_root = os.path.join(DATA_DIR, "update_backups", time.strftime("%Y%m%d-%H%M%S"))
+        backup_root = ""
+        backup_manifest: Dict[str, Any] = {}
 
         # 下载阶段（带兜底切换），任意源成功即停止
         source = requested_source
@@ -2386,13 +2616,34 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
             print(f"[update] 所有下载源均失败 → {detail}")
             raise HTTPException(status_code=502, detail=f"所有下载源均失败 → {detail}")
 
+        validate_staged_update(staging_root, root_files, static_files)
+
+        new_version = ""
+        try:
+            with open(os.path.join(staging_root, "VERSION"), "r", encoding="utf-8") as f:
+                new_version = (f.read().strip().splitlines() or [""])[0].strip()
+        except Exception:
+            pass
+        notes_file = os.path.join(staging_root, "static", "update-notes.json")
+        update_notes: Dict[str, Any] = {}
+        try:
+            if os.path.exists(notes_file):
+                with open(notes_file, "r", encoding="utf-8") as f:
+                    update_notes = safe_update_notes(json.load(f), new_version)
+        except Exception:
+            update_notes = {}
+        # A restore point must be complete before any live file is replaced.
+        backup_root = next_update_backup_dir()
+        backup_manifest = create_update_backup(
+            backup_root,
+            root_files,
+            static_files,
+            kind="update",
+            source=source,
+            target_version=new_version,
+            update_notes=update_notes,
+        )
         updated = []
-        for rel in root_files:
-            target = safe_update_target(rel)
-            if os.path.exists(target):
-                backup_path = os.path.join(backup_root, *rel.split("/"))
-                os.makedirs(os.path.dirname(backup_path), exist_ok=True)
-                shutil.copy2(target, backup_path)
 
         staged_static_dir = os.path.join(staging_root, "static")
         if not os.path.isdir(staged_static_dir):
@@ -2400,8 +2651,6 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
         static_dir = safe_static_dir()
         backup_static_dir = os.path.join(backup_root, "static")
         if os.path.isdir(static_dir):
-            os.makedirs(os.path.dirname(backup_static_dir), exist_ok=True)
-            shutil.copytree(static_dir, backup_static_dir)
             shutil.rmtree(static_dir)
         try:
             shutil.copytree(staged_static_dir, static_dir)
@@ -2431,6 +2680,8 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
                     temp_path = f"{target}.rollback_tmp"
                     shutil.copy2(backup_path, temp_path)
                     os.replace(temp_path, target)
+                elif not bool((backup_manifest.get("root_files") or {}).get(rel, {}).get("existed")) and os.path.exists(target):
+                    os.remove(target)
             if os.path.isdir(static_dir):
                 shutil.rmtree(static_dir, ignore_errors=True)
             if os.path.isdir(backup_static_dir):
@@ -2440,22 +2691,7 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
         restart_scheduled = False
         if req.auto_restart and updated:
             restart_scheduled = schedule_self_restart(req.restart_delay)
-        new_version = ""
-        try:
-            staged_version = os.path.join(staging_root, "VERSION")
-            if os.path.exists(staged_version):
-                with open(staged_version, "r", encoding="utf-8") as f:
-                    new_version = (f.read().strip().splitlines() or [""])[0].strip()
-        except Exception:
-            new_version = ""
-        notes_file = os.path.join(staging_root, "static", "update-notes.json")
-        update_notes = {}
-        try:
-            if os.path.exists(notes_file):
-                with open(notes_file, "r", encoding="utf-8") as f:
-                    update_notes = safe_update_notes(json.load(f), new_version)
-        except Exception:
-            update_notes = {}
+        pruned_backups = prune_update_backups({os.path.basename(backup_root)})
         return {
             "ok": True,
             "source": source,
@@ -2467,7 +2703,9 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
             "count": len(updated),
             "version": new_version,
             "update_notes": update_notes,
-            "backup_dir": backup_root if os.path.exists(backup_root) else "",
+            "backup_dir": backup_root,
+            "backup": backup_manifest,
+            "pruned_backups": pruned_backups,
             "restart_required": True,
             "restart_scheduled": restart_scheduled,
         }
@@ -2481,7 +2719,7 @@ def update_from_github(req: UpdateRequest = UpdateRequest()):
         UPDATE_LOCK.release()
 
 def list_update_backups() -> List[Dict[str, Any]]:
-    root = os.path.join(DATA_DIR, "update_backups")
+    root = update_backup_root()
     if not os.path.isdir(root):
         return []
     items = []
@@ -2489,19 +2727,28 @@ def list_update_backups() -> List[Dict[str, Any]]:
         bp = os.path.join(root, name)
         if not os.path.isdir(bp):
             continue
-        file_count = 0
-        for _, _, fs in os.walk(bp):
-            file_count += len(fs)
+        manifest = read_update_backup_manifest(bp)
+        if manifest and manifest.get("state") != "ready":
+            continue
+        file_count = count_regular_files(bp) - (1 if manifest else 0)
         try:
-            created_at = os.path.getmtime(bp)
+            created_at = float(manifest.get("created_at") or os.path.getmtime(bp))
         except OSError:
             created_at = 0.0
         items.append({
             "name": name,
-            "file_count": file_count,
+            "file_count": max(0, file_count),
             "created_at": created_at,
+            "format": manifest.get("format") if manifest else 1,
+            "kind": manifest.get("kind") if manifest else "legacy",
+            "from_version": manifest.get("from_version") if manifest else "",
+            "target_version": manifest.get("target_version") if manifest else "",
+            "source": manifest.get("source") if manifest else "",
+            "update_notes": manifest.get("update_notes") if manifest else {},
+            "affected_file_count": len(manifest.get("affected_files") or []) if manifest else file_count,
+            "affected_files": list(manifest.get("affected_files") or [])[:30] if manifest else [],
         })
-    return items
+    return sorted(items, key=lambda item: float(item.get("created_at") or 0), reverse=True)
 
 @app.get("/api/update-backups")
 def get_update_backups():
@@ -2525,8 +2772,30 @@ def rollback_update(req: RollbackRequest):
             raise HTTPException(status_code=400, detail="备份路径不安全")
         if not os.path.isdir(backup_dir):
             raise HTTPException(status_code=404, detail="备份不存在")
+        manifest = read_update_backup_manifest(backup_dir)
+        if manifest and manifest.get("state") != "ready":
+            raise HTTPException(status_code=409, detail="备份尚未完整创建，不能还原")
+        manifest_roots = manifest.get("root_files") if isinstance(manifest.get("root_files"), dict) else {}
+        root_files = sorted(manifest_roots.keys()) if manifest_roots else ["main.py", "VERSION"]
+        # Restoring is itself a risky operation. Preserve the live version first so
+        # the user can roll forward again if the selected historical build is worse.
+        rollback_backup_dir = next_update_backup_dir("rollback-")
+        rollback_backup = create_update_backup(
+            rollback_backup_dir,
+            root_files,
+            [],
+            kind="rollback_safety",
+            source="local-rollback",
+            target_version=str(manifest.get("from_version") or "").strip(),
+            parent_backup=req.name,
+            update_notes={
+                "version": current_app_version(),
+                "items": [{"type": "rollback", "text": f"还原恢复点 {req.name}"}],
+            },
+        )
         restored = []
         skipped = []
+        removed = []
         backup_static_dir = os.path.join(backup_dir, "static")
         if os.path.isdir(backup_static_dir):
             static_dir = safe_static_dir()
@@ -2542,6 +2811,11 @@ def rollback_update(req: RollbackRequest):
                 for fn in filenames:
                     src = os.path.join(dirpath, fn)
                     restored.append(os.path.relpath(src, backup_dir).replace("\\", "/"))
+        elif manifest and isinstance(manifest.get("static_snapshot"), dict) and not manifest["static_snapshot"].get("exists"):
+            static_dir = safe_static_dir()
+            if os.path.isdir(static_dir):
+                shutil.rmtree(static_dir)
+                removed.append("static/")
         for dirpath, _, filenames in os.walk(backup_dir):
             for fn in filenames:
                 src = os.path.join(dirpath, fn)
@@ -2562,14 +2836,28 @@ def rollback_update(req: RollbackRequest):
                     shutil.copyfileobj(fin, fout)
                 os.replace(temp_path, target)
                 restored.append(rel)
+        for rel, info in manifest_roots.items():
+            if not update_allowed_file(rel) or str(rel).startswith("static/"):
+                continue
+            if bool((info or {}).get("existed")):
+                continue
+            target = safe_update_target(rel)
+            if os.path.isfile(target):
+                os.remove(target)
+                removed.append(rel)
         restart_scheduled = False
         if req.auto_restart and restored:
             restart_scheduled = schedule_self_restart(req.restart_delay)
+        pruned_backups = prune_update_backups({req.name, os.path.basename(rollback_backup_dir)})
         return {
             "ok": True,
             "restored": restored,
             "skipped": skipped,
+            "removed": removed,
             "count": len(restored),
+            "rollback_backup_dir": rollback_backup_dir,
+            "rollback_backup": rollback_backup,
+            "pruned_backups": pruned_backups,
             "restart_required": True,
             "restart_scheduled": restart_scheduled,
         }
@@ -3771,6 +4059,10 @@ def resolve_chat_provider(provider: str, model: str, ms_model: str):
     mdl = selected_model(model, default_model)
     protocol = effective_protocol(api_provider, mdl)
     if protocol == "gemini":
+        # APIMart's native Gemini API is served from its official API domain.
+        # Keep the configured base URL for its OpenAI-compatible models only.
+        if is_apimart_provider(api_provider):
+            base_root = "https://api.apimart.ai"
         base = base_root if base_root.endswith("/v1beta") else base_root + "/v1beta"
     elif protocol == "volcengine":
         base = base_root if base_root.endswith("/api/v3") else base_root + "/api/v3"
@@ -4614,15 +4906,6 @@ def effective_protocol(provider, model=""):
 def is_apimart_provider(provider):
     base_url = str((provider or {}).get("base_url") or "").lower()
     return provider_protocol(provider) == "apimart" or "apimart.ai" in base_url
-
-def is_fhl_provider(provider):
-    base_url = str((provider or {}).get("base_url") or "").strip().lower()
-    name = str((provider or {}).get("name") or "").strip().lower()
-    try:
-        host = urllib.parse.urlsplit(base_url).netloc.lower()
-    except Exception:
-        host = ""
-    return host in {"www.fhl.mom", "fhl.mom"} or name in {"fhl", "fhl-image"}
 
 def detect_image_request_mode(base_url="", models=None):
     base = str(base_url or "").strip().lower()
@@ -5953,7 +6236,7 @@ async def run_jimeng_cli(args, timeout=120, raw_text=False):
                     raw.setdefault("_stderr", clean_err_text)
                 return raw
         message = clean_err_text or out_text or f"exit={proc.returncode}"
-        raise HTTPException(status_code=502, detail=f"即梦 CLI 调用失败：{message[:1000]}")
+        raise HTTPException(status_code=502, detail=f"即梦 CLI 调用失败：{jimeng_friendly_error_detail(message[:1000])}")
     # 帮助等纯文本输出不应被 JSON 提取吞掉（如 [0.5, 8] 会被误判为结果）
     if raw_text:
         return {"_stdout": out_text, "_stderr": clean_err_text}
@@ -6117,7 +6400,13 @@ def jimeng_failure_reason(raw):
             for item in value:
                 visit(item)
     visit(raw)
-    return found[0] if found else ""
+    return jimeng_friendly_error_detail(found[0]) if found else ""
+
+def jimeng_friendly_error_detail(detail):
+    text = str(detail or "").strip()
+    if "aigccomplianceconfirmationrequired" in text.lower():
+        return "即梦要求先完成内容安全授权。请在 Dreamina 网页端按提示确认授权后，再返回此处重试。"
+    return text
 
 def jimeng_collect_media_values(value, outputs):
     media_ext = re.compile(r"\.(png|jpe?g|webp|gif|bmp|mp4|webm|mov|m4v|avi|mkv)(\?|#|$)", re.I)
@@ -6246,23 +6535,25 @@ def jimeng_video_resolution(model, resolution):
     return requested if requested in {"720p", "1080p", "4k"} else "720p"
 
 # 各模型支持的时长区间（秒）：3.0 系列 3-10，3.5pro 4-12，seedance 4-15
-def jimeng_video_duration_range(model):
+def jimeng_video_duration_range(model, command=""):
     version = jimeng_video_model_version(model)
-    if version in ("3.0", "3.0fast", "3.0pro"):
-        return 3, 10
-    if version == "3.5pro":
-        return 4, 12
+    if command in {"image2video", "frames2video"} and version == "seedance1.5pro":
+        return 5, 12
+    if command == "image2video" and version == "seedance1.0fast":
+        return 5, 10
     return 4, 15
 
-def jimeng_video_duration(duration, model=None):
-    low, high = jimeng_video_duration_range(model)
+def jimeng_video_duration(duration, model=None, command=""):
+    low, high = jimeng_video_duration_range(model, command)
     default = max(low, min(high, 5))
     try:
         text = str(duration).strip() if duration is not None else ""
         value = default if text == "" else int(text)
     except Exception:
-        value = default
-    return max(low, min(high, value))
+        raise HTTPException(status_code=400, detail=f"即梦视频时长必须是 {low}-{high} 秒的整数。")
+    if not low <= value <= high:
+        raise HTTPException(status_code=400, detail=f"即梦模型 {jimeng_video_model_version(model) or model} 只支持 {low}-{high} 秒时长。")
+    return value
 
 # multiframe2video 每段转场时长：把用户设定的总时长按段数均分，单段严格 1-8s（CLI 硬性要求，
 # 总时长需 >=2）。取整更贴近 CLI 习惯。
@@ -6295,6 +6586,7 @@ def jimeng_video_model_version(model):
         "seedance1.5pro": "seedance1.5pro",
         "seedance2.0fast_vip": "seedance2.0fast_vip",
         "seedance2.0_vip": "seedance2.0_vip",
+        "seedance2.0mini": "seedance2.0mini",
         "seedance2.0fast": "seedance2.0fast",
         "seedance2.0": "seedance2.0",
     }
@@ -6302,6 +6594,14 @@ def jimeng_video_model_version(model):
         if key in low:
             return mapped if mapped in JIMENG_VIDEO_MODEL_VERSIONS else ""
     return ""
+
+def jimeng_video_model_for_command(model, command):
+    version = jimeng_video_model_version(model)
+    allowed = JIMENG_VIDEO_MODELS_BY_COMMAND.get(command) or set()
+    if version in allowed:
+        return version
+    supported = "、".join(sorted(allowed))
+    raise HTTPException(status_code=400, detail=f"即梦 {command} 不支持模型「{model}」。可用模型：{supported}。")
 
 def jimeng_video_resolution_arg(model, resolution):
     return jimeng_video_resolution(model, resolution)
@@ -6313,9 +6613,17 @@ def jimeng_video_ratio_arg(aspect_ratio):
         return value
     return ""
 
-def jimeng_append_model_resolution_args(args, payload: CanvasVideoRequest, include_model=False):
-    model_version = jimeng_video_model_version(payload.model)
-    if include_model and model_version:
+def jimeng_video_ratio(aspect_ratio, default="16:9"):
+    value = str(aspect_ratio or "").strip()
+    if not value:
+        return default
+    ratio = jimeng_video_ratio_arg(value)
+    if not ratio:
+        raise HTTPException(status_code=400, detail="即梦视频比例仅支持 1:1、3:4、16:9、4:3、9:16、21:9。")
+    return ratio
+
+def jimeng_append_model_resolution_args(args, payload: CanvasVideoRequest, model_version=""):
+    if model_version:
         args.append(f"--model_version={model_version}")
     resolution = jimeng_video_resolution_arg(payload.model, payload.resolution)
     if resolution:
@@ -6529,10 +6837,13 @@ async def generate_jimeng_video(payload: CanvasVideoRequest, provider):
     image_refs = [ref for ref in (payload.images or []) if jimeng_video_ref_url(ref)]
     video_refs = [url for url in (payload.videos or []) if str(url or "").strip()]
     audio_refs = [url for url in (payload.audios or []) if str(url or "").strip()][:3]
-    duration = jimeng_video_duration(payload.duration, payload.model)
     temp_paths = []
     try:
         if payload.multimodal or video_refs or audio_refs:
+            if not image_refs and not video_refs:
+                raise HTTPException(status_code=400, detail="即梦全能参考至少需要一张图片或一个视频，音频不能单独生成视频。")
+            model_version = jimeng_video_model_for_command(payload.model, "multimodal2video")
+            duration = jimeng_video_duration(payload.duration, model_version, "multimodal2video")
             image_paths = []
             video_paths = []
             audio_paths = []
@@ -6554,10 +6865,8 @@ async def generate_jimeng_video(payload: CanvasVideoRequest, provider):
                 f"--duration={duration}",
                 f"--poll={jimeng_poll_seconds()}",
             ]
-            ratio = jimeng_video_ratio_arg(payload.aspect_ratio)
-            if ratio:
-                args.append(f"--ratio={ratio}")
-            jimeng_append_model_resolution_args(args, payload, include_model=True)
+            args.append(f"--ratio={jimeng_video_ratio(payload.aspect_ratio)}")
+            jimeng_append_model_resolution_args(args, payload, model_version)
             for image_path in image_paths:
                 args.append(f"--image={jimeng_cli_path_arg(image_path)}")
             for video_path in video_paths:
@@ -6565,9 +6874,13 @@ async def generate_jimeng_video(payload: CanvasVideoRequest, provider):
             for audio_path in audio_paths:
                 args.append(f"--audio={jimeng_cli_path_arg(audio_path)}")
         elif len(image_refs) >= 2:
+            if len(image_refs) > 20:
+                raise HTTPException(status_code=400, detail="即梦多帧视频最多支持 20 张图片。")
             first_frame = next((ref for ref in image_refs if jimeng_video_ref_role(ref) == "first_frame"), None)
             last_frame = next((ref for ref in image_refs if jimeng_video_ref_role(ref) == "last_frame"), None)
             if first_frame and last_frame:
+                model_version = jimeng_video_model_for_command(payload.model, "frames2video")
+                duration = jimeng_video_duration(payload.duration, model_version, "frames2video")
                 first_path, created = await jimeng_prepare_local_media(jimeng_video_ref_url(first_frame), "image")
                 temp_paths.extend(created)
                 last_path, created = await jimeng_prepare_local_media(jimeng_video_ref_url(last_frame), "image")
@@ -6580,7 +6893,7 @@ async def generate_jimeng_video(payload: CanvasVideoRequest, provider):
                     f"--duration={duration}",
                     f"--poll={jimeng_poll_seconds()}",
                 ]
-                jimeng_append_model_resolution_args(args, payload, include_model=True)
+                jimeng_append_model_resolution_args(args, payload, model_version)
             else:
                 image_paths = []
                 for ref in image_refs:
@@ -6610,29 +6923,21 @@ async def generate_jimeng_video(payload: CanvasVideoRequest, provider):
                     for _ in range(segments):
                         args.append(f"--transition-duration={seg_duration}")
         elif image_refs:
+            model_version = jimeng_video_model_for_command(payload.model, "image2video")
+            duration = jimeng_video_duration(payload.duration, model_version, "image2video")
             image_path, created = await jimeng_prepare_local_media(jimeng_video_ref_url(image_refs[0]), "image")
             temp_paths.extend(created)
-            ratio = jimeng_video_ratio_arg(payload.aspect_ratio)
-            if ratio:
-                args = [
-                    "multimodal2video",
-                    f"--image={jimeng_cli_path_arg(image_path)}",
-                    f"--prompt={payload.prompt}",
-                    f"--duration={duration}",
-                    f"--ratio={ratio}",
-                    f"--poll={jimeng_poll_seconds()}",
-                ]
-                jimeng_append_model_resolution_args(args, payload, include_model=True)
-            else:
-                args = [
-                    "image2video",
-                    f"--image={jimeng_cli_path_arg(image_path)}",
-                    f"--prompt={payload.prompt}",
-                    f"--duration={duration}",
-                    f"--poll={jimeng_poll_seconds()}",
-                ]
-                jimeng_append_model_resolution_args(args, payload, include_model=True)
+            args = [
+                "image2video",
+                f"--image={jimeng_cli_path_arg(image_path)}",
+                f"--prompt={payload.prompt}",
+                f"--duration={duration}",
+                f"--poll={jimeng_poll_seconds()}",
+            ]
+            jimeng_append_model_resolution_args(args, payload, model_version)
         else:
+            model_version = jimeng_video_model_for_command(payload.model, "text2video")
+            duration = jimeng_video_duration(payload.duration, model_version, "text2video")
             args = [
                 "text2video",
                 f"--prompt={payload.prompt}",
@@ -10174,6 +10479,8 @@ def gemini_model_name(model):
 
 def gemini_endpoint_url(provider, model):
     model_name = urllib.parse.quote(gemini_model_name(model), safe="")
+    if is_apimart_provider(provider) and not str((provider or {}).get("image_generation_endpoint") or "").strip():
+        return f"https://api.apimart.ai/v1beta/models/{model_name}:generateContent"
     return provider_endpoint_url(provider, "image_generation_endpoint", f"/v1beta/models/{model_name}:generateContent")
 
 def gemini_image_config(size):
@@ -10218,7 +10525,9 @@ async def generate_gemini_provider_image(prompt, size, model, reference_images=N
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=1800.0, write=120.0, pool=20.0)) as client:
         response = await client.post(endpoint, headers=api_headers(provider=provider), json=body)
         response.raise_for_status()
-        raw = response.json()
+        # APIMart wraps the native Gemini body in {code, data}; unwrap it before
+        # image extraction so candidates[].content.parts[].inlineData is visible.
+        raw = unwrap_apimart_response(response.json()) if is_apimart_provider(provider) else response.json()
         return extract_image(raw), raw
 
 def volcengine_endpoint_url(provider):
@@ -11539,31 +11848,31 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
             local_image_paths = [openai_video_proxy_local_image_path(ref) for ref in refs_for_proxy]
             has_local_images = any(local_image_paths)
             if has_local_images:
-                form_data = {key: value for key, value in body.items()}
+                form_data = [(key, value) for key, value in body.items()]
                 for ref, local_path in zip(refs_for_proxy, local_image_paths):
                     if local_path:
                         continue
                     url = await openai_video_proxy_public_reference_url(ref)
                     if url:
-                        existing_images = form_data.get("images")
-                        if isinstance(existing_images, list):
-                            existing_images.append(url)
-                        elif existing_images:
-                            form_data["images"] = [existing_images, url]
-                        else:
-                            form_data["images"] = url
+                        form_data.append(("images", url))
                 files = []
-                for local_path in local_image_paths:
-                    if not local_path:
-                        continue
-                    with open(local_path, "rb") as fh:
-                        content = fh.read()
-                    files.append(("images", (os.path.basename(local_path), content, content_type_for_path(local_path))))
-                headers = api_headers(json_body=False, provider=provider, model=model)
-                def post_video_proxy_multipart():
-                    with httpx.Client(timeout=request_timeout) as sync_client:
-                        return sync_client.post(video_url, headers=headers, data=form_data, files=files)
-                response = await asyncio.to_thread(post_video_proxy_multipart)
+                opened = []
+                try:
+                    for local_path in local_image_paths:
+                        if not local_path:
+                            continue
+                        fh = open(local_path, "rb")
+                        opened.append(fh)
+                        files.append(("images", (os.path.basename(local_path), fh, content_type_for_path(local_path))))
+                    response = await client.post(
+                        video_url,
+                        headers=api_headers(json_body=False, provider=provider, model=model),
+                        data=form_data,
+                        files=files,
+                    )
+                finally:
+                    for fh in opened:
+                        fh.close()
             else:
                 if refs_for_proxy:
                     body["images"] = [await openai_video_proxy_public_reference_url(ref) for ref in refs_for_proxy]
@@ -14197,6 +14506,17 @@ async def probe_async_endpoint(payload: TestConnectionPayload):
                     "raw": body,
                 }
             # 400 + "invalid task id" → 端点存在，Key 有效
+            if is_tudou_async and sc == 400:
+                # 土豆对不存在的 task_id 可能使用不同的 400 错误字段；只要不是
+                # 401/403，400 已证明请求命中了异步任务端点且认证通过。
+                return {
+                    "ok": True,
+                    "protocol": "openai",
+                    "image_request_mode": "tudou-async",
+                    "status_code": sc,
+                    "message": "土豆 GPT-Image-2 异步任务端点可用，API Key 已通过认证",
+                    "raw": body,
+                }
             if sc == 400 and "invalid task id" in err_msg:
                 if openai_async_probe:
                     return openai_async_image_default_model_payload(
@@ -16048,6 +16368,320 @@ async def generate_yuli_openai_video(client, payload, provider, base_url, reques
         raise HTTPException(status_code=502, detail=f"视频生成成功但没有返回视频：{result}")
     local_urls = [await save_remote_video_to_output(url) for url in urls]
     return {"videos": local_urls, "task_id": task_id, "raw": result}
+
+TUDOU_GROK_IMAGE_SIZES = {"1024x1024", "1280x720", "720x1280", "1792x1024", "1024x1792"}
+TUDOU_GROK_IMAGE_ASPECT_SIZES = {
+    "1:1": "1024x1024", "16:9": "1280x720", "9:16": "720x1280",
+    "3:2": "1792x1024", "2:3": "1024x1792",
+}
+
+def tudou_grok_image_size(size, aspect_ratio=""):
+    value = str(size or "").strip().lower().replace("*", "x").replace("×", "x")
+    if value in TUDOU_GROK_IMAGE_SIZES:
+        return value
+    if str(aspect_ratio or "").strip() in TUDOU_GROK_IMAGE_ASPECT_SIZES:
+        return TUDOU_GROK_IMAGE_ASPECT_SIZES[str(aspect_ratio).strip()]
+    match = re.match(r"^(\d+)\s*x\s*(\d+)$", value)
+    if match:
+        width, height = int(match.group(1)), int(match.group(2))
+        if width and height:
+            ratio = width / height
+            choices = {"1024x1024": 1.0, "1280x720": 16 / 9, "720x1280": 9 / 16, "1792x1024": 3 / 2, "1024x1792": 2 / 3}
+            return min(choices, key=lambda candidate: abs(choices[candidate] - ratio))
+    return "1024x1024"
+
+def tudou_api_endpoint(base_url, path):
+    base = str(base_url or "").rstrip("/")
+    return f"{base}{path}" if base.endswith("/v1") else f"{base}/v1{path}"
+
+def tudou_reference_urls(ref):
+    source = ref if isinstance(ref, dict) else {}
+    urls = []
+    for key in ("url", "original_url", "originalLocalUrl", "source_url"):
+        value = str(source.get(key) or "").strip()
+        if value and value not in urls:
+            urls.append(value)
+    return urls
+
+async def generate_tudou_grok_image(prompt, size, model, reference_images, provider, aspect_ratio=""):
+    """Use Tudou's Grok multipart edit route without changing generic OpenAI image behavior."""
+    model = selected_model(model, "grok-imagine-image")
+    base_url = str(provider.get("base_url") or "").rstrip("/")
+    if not base_url:
+        raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider['id']} 未配置 Base URL")
+    refs = [item for item in (reference_images or []) if isinstance(item, dict) and item.get("url")]
+    is_edit = "edit" in model.lower() or bool(refs)
+    timeout = httpx.Timeout(connect=20.0, read=600.0, write=120.0, pool=20.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        if is_edit:
+            edit_model = model if "edit" in model.lower() else "grok-imagine-image-edit"
+            parts = [(key, (None, str(value))) for key, value in {
+                "model": edit_model,
+                "prompt": str(prompt or ""),
+                "n": "1",
+                "size": "1024x1024",
+                "response_format": "url",
+            }.items()]
+            attached = 0
+            for ref in refs[:7]:
+                for value in tudou_reference_urls(ref):
+                    if value.lower().startswith("asset://"):
+                        continue
+                    ref_file = await yuli_fetch_reference_bytes(client, value)
+                    if ref_file:
+                        parts.append(("image[]", ref_file))
+                        attached += 1
+                        break
+            if attached <= 0:
+                raise HTTPException(status_code=400, detail="土豆 Grok 图像编辑没有成功读取参考图。请使用本地图片、公网图片 URL 或 data:image;base64。")
+            response = await client.post(
+                tudou_api_endpoint(base_url, "/images/edits"),
+                headers=api_headers(json_body=False, provider=provider, model=edit_model),
+                files=parts,
+            )
+        else:
+            response = await client.post(
+                tudou_api_endpoint(base_url, "/images/generations"),
+                headers=api_headers(json_body=True, provider=provider, model=model),
+                json={"model": model, "prompt": str(prompt or ""), "n": 1, "size": tudou_grok_image_size(size, aspect_ratio), "response_format": "url"},
+            )
+        response.raise_for_status()
+        try:
+            raw = response.json()
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"土豆 Grok 图像接口返回非 JSON 响应：{(response.text or '')[:500]}") from exc
+    images = extract_images(raw)
+    if not images:
+        raise HTTPException(status_code=502, detail=f"土豆 Grok 图像接口没有返回图片：{str(raw)[:400]}")
+    return images[0], raw
+
+TUDOU_VIDEO_SUCCESS_STATUSES = {"COMPLETED", "COMPLETE", "DONE", "FINISHED", "SUCCESS", "SUCCEED", "SUCCEEDED", "SUCCESSFUL", "OK", "READY"}
+TUDOU_VIDEO_FAILED_STATUSES = {"FAILED", "FAIL", "FAILURE", "ERROR", "ERRORED", "CANCELED", "CANCELLED", "TIMEOUT", "REJECTED", "EXPIRED"}
+
+def tudou_video_family(model):
+    value = str(model or "").strip().lower()
+    if value.startswith("sora2"):
+        return "sora2"
+    if value.startswith("veo3.1"):
+        return "veo31"
+    if value.startswith("kling-v3"):
+        return "kling"
+    if value.startswith("pixverse-v6"):
+        return "pixverse"
+    if "seedance-2.0" in value:
+        return "seedance"
+    return ""
+
+def is_tudou_video_model(model):
+    return bool(tudou_video_family(model)) or is_tudou_grok_video_model(model)
+
+def tudou_snap_choice(value, choices, default):
+    try:
+        parsed = int(round(float(value)))
+    except Exception:
+        return default
+    return parsed if parsed in choices else min(choices, key=lambda choice: abs(choice - parsed))
+
+def tudou_video_aspect(value, allowed=("16:9", "9:16"), default="16:9"):
+    value = str(value or "").strip()
+    return value if value in allowed else default
+
+def tudou_task_data(raw):
+    return raw.get("data") if isinstance(raw, dict) and isinstance(raw.get("data"), dict) else raw if isinstance(raw, dict) else {}
+
+def tudou_extract_task_id(raw):
+    data = tudou_task_data(raw)
+    return str(data.get("id") or data.get("task_id") or (raw or {}).get("id") or (raw or {}).get("task_id") or "").strip()
+
+def tudou_video_result_urls(raw):
+    result = tudou_task_data(raw).get("result")
+    result = result if isinstance(result, dict) else {}
+    urls = []
+    def add(value):
+        if isinstance(value, list):
+            for item in value:
+                add(item)
+        elif isinstance(value, dict):
+            add(value.get("url") or value.get("video_url"))
+        elif isinstance(value, str) and value.strip() and value.strip() not in urls:
+            urls.append(value.strip())
+    add(result.get("video_url"))
+    for key in ("videos", "images", "outputs", "result"):
+        add(result.get(key))
+    return urls
+
+async def tudou_public_image_urls(images, limit):
+    urls = []
+    for ref in list(images or [])[:limit]:
+        value = str(getattr(ref, "url", "") or "").strip()
+        if value:
+            urls.append(await openai_video_proxy_public_reference_url({"url": value}))
+    return urls
+
+async def tudou_public_media_urls(items, limit):
+    urls = []
+    for item in list(items or [])[:limit]:
+        value = str(item or "").strip()
+        if value:
+            urls.append(await openai_video_proxy_public_reference_url(value))
+    return urls
+
+async def tudou_wait_video_task(client, provider, base_url, task_id):
+    deadline = time.monotonic() + VIDEO_POLL_TIMEOUT
+    await asyncio.sleep(min(12.0, VIDEO_POLL_TIMEOUT))
+    delay = 5.0
+    last_payload = {}
+    task_url = f"{base_url}/v1/tasks/{urllib.parse.quote(str(task_id), safe='')}"
+    while time.monotonic() < deadline:
+        response = await client.get(task_url, headers=api_headers(provider=provider))
+        response.raise_for_status()
+        last_payload = response.json()
+        data = tudou_task_data(last_payload)
+        status = str(data.get("status") or data.get("task_status") or "").upper()
+        if status in TUDOU_VIDEO_SUCCESS_STATUSES or tudou_video_result_urls(last_payload):
+            return last_payload
+        if status in TUDOU_VIDEO_FAILED_STATUSES:
+            error = data.get("error") if isinstance(data.get("error"), dict) else {}
+            reason = error.get("message") or data.get("message") or data.get("fail_reason") or str(last_payload)[:300]
+            raise HTTPException(status_code=502, detail=f"土豆视频生成失败：{reason}")
+        await asyncio.sleep(delay)
+        delay = min(delay * 1.4, 10.0)
+    raise HTTPException(status_code=504, detail=f"土豆视频任务超时：{task_id}")
+
+async def generate_tudou_video(client, payload, provider, base_url, requested_model):
+    family = tudou_video_family(requested_model)
+    model = selected_model(requested_model, requested_model)
+    aspect = tudou_video_aspect(payload.aspect_ratio or payload.size)
+    body = {"model": model, "prompt": str(payload.prompt or "")}
+    if family == "sora2":
+        body.update(duration=tudou_snap_choice(payload.duration, (4, 8, 12), 8), aspect_ratio=aspect, generate_audio=bool(payload.generate_audio))
+        images = await tudou_public_image_urls(payload.images, 1)
+        if images: body["images"] = images
+    elif family == "veo31":
+        body.update(resolution="1080p" if model.lower().endswith("1080p") else "720p", duration=tudou_snap_choice(payload.duration, (4, 6, 8), 8), aspect_ratio=aspect, generate_audio=bool(payload.generate_audio))
+        images = await tudou_public_image_urls(payload.images, 3)
+        if images:
+            body["reference_mode"] = "image" if len(images) > 2 else "frame"
+            body["images"] = images
+    elif family == "kling":
+        images = await tudou_public_image_urls(payload.images, 2)
+        if not images:
+            raise HTTPException(status_code=400, detail="土豆 Kling v3 系列只支持图生视频，请至少提供 1 张参考图。")
+        durations = (5, 10, 15) if model.lower() == "kling-v3" else (5, 15)
+        body.update(duration=tudou_snap_choice(payload.duration, durations, 10 if model.lower() == "kling-v3" else 15), aspect_ratio=aspect, generate_audio=bool(payload.generate_audio), images=images)
+    elif family == "pixverse":
+        lower = model.lower()
+        body.update(resolution="1080p" if "1080p" in lower else "720p", audio=lower.endswith("-audio"), size=tudou_video_aspect(payload.aspect_ratio or payload.size, allowed=("16:9", "4:3", "1:1", "3:4", "9:16", "2:3", "3:2", "21:9")))
+        first = next((ref for ref in payload.images if str(ref.role or "").lower() == "first_frame"), None)
+        last = next((ref for ref in payload.images if str(ref.role or "").lower() == "last_frame"), None)
+        if first and last:
+            body.update(first_frame_image=await openai_video_proxy_public_reference_url({"url": first.url}), last_frame_image=await openai_video_proxy_public_reference_url({"url": last.url}), duration=tudou_snap_choice(payload.duration, (5, 8), 5))
+        else:
+            images = await tudou_public_image_urls(payload.images, 7)
+            if images: body["img_references"] = images
+            body["duration"] = max(1, min(15, tudou_snap_choice(payload.duration, tuple(range(1, 16)), 5)))
+    elif family == "seedance":
+        body.update(model="seedance-2.0-fast" if "fast" in model.lower() else "seedance-2.0", duration=tudou_snap_choice(payload.duration, tuple(range(4, 16)), 4), aspect_ratio=aspect, resolution="1080p" if str(payload.resolution or "").lower().startswith("1080") else "720p", generate_audio=bool(payload.generate_audio))
+        images, videos = await tudou_public_image_urls(payload.images, 9), await tudou_public_media_urls(payload.videos, 3)
+        if images: body["images"] = images
+        if videos: body["videos"] = videos
+        if images or videos:
+            audios = await tudou_public_media_urls(payload.audios, 3)
+            if audios: body["audios"] = audios
+    else:
+        raise HTTPException(status_code=400, detail=f"未知的土豆视频模型：{model}")
+    response = await client.post(f"{base_url}/v1/videos/generations", headers=api_headers(provider=provider, model=model), json=body)
+    response.raise_for_status()
+    try:
+        raw = response.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"土豆视频接口返回非 JSON 响应：{(response.text or '')[:500]}") from exc
+    task_id = tudou_extract_task_id(raw)
+    if not task_id:
+        raise HTTPException(status_code=502, detail=f"土豆视频提交未返回任务 ID：{str(raw)[:400]}")
+    result = raw if tudou_video_result_urls(raw) else await tudou_wait_video_task(client, provider, base_url, task_id)
+    urls = tudou_video_result_urls(result)
+    if not urls:
+        raise HTTPException(status_code=502, detail=f"土豆视频任务完成但未返回视频地址：{str(result)[:400]}")
+    return {"videos": [await save_remote_video_to_output(url, prefix="tudou_video_") for url in urls], "task_id": task_id, "raw": result}
+
+def tudou_grok_video_seconds(duration):
+    allowed = (6, 10, 12, 16, 20)
+    try:
+        value = int(duration)
+    except Exception:
+        value = 6
+    return str(value if value in allowed else next((item for item in allowed if item >= value), allowed[-1]))
+
+def tudou_grok_video_size(aspect_ratio="", resolution=""):
+    ratio = str(aspect_ratio or "").strip()
+    high = str(resolution or "").strip().lower() in {"1080p", "4k", "high", "hd"}
+    if ratio == "9:16": return "1024x1792" if high else "720x1280"
+    if ratio == "1:1": return "1024x1024"
+    return "1792x1024" if high else "1280x720"
+
+async def tudou_grok_video_part(client, ref):
+    for value in (str(getattr(ref, key, "") or "").strip() for key in ("url", "original_url", "originalLocalUrl", "source_url")):
+        if not value or value.lower().startswith("asset://"):
+            continue
+        ref_file = await yuli_fetch_reference_bytes(client, value)
+        if ref_file:
+            return ("input_reference[]", ref_file)
+    return None
+
+async def save_video_bytes_to_output(data, prefix="video_", ext=".mp4"):
+    if not data:
+        raise HTTPException(status_code=502, detail="上游视频下载为空")
+    extension = ext if ext in {".mp4", ".webm", ".mov", ".m4v", ".avi", ".mkv", ".flv"} else ".mp4"
+    filename = f"{prefix}{uuid.uuid4().hex[:10]}{extension}"
+    path = output_path_for(filename, "output")
+    with open(path, "wb") as file:
+        file.write(data)
+    if os.path.getsize(path) <= 0:
+        raise HTTPException(status_code=502, detail="上游视频下载为空")
+    return output_url_for(filename, "output")
+
+async def download_tudou_grok_video_content(client, provider, base_url, task_id):
+    response = await client.get(
+        f"{base_url}/v1/videos/{urllib.parse.quote(str(task_id), safe='')}/content",
+        headers=api_headers(provider=provider),
+    )
+    response.raise_for_status()
+    content_type = (response.headers.get("content-type") or "").lower()
+    extension = ".webm" if "webm" in content_type else ".mov" if "quicktime" in content_type or "mov" in content_type else ".mp4"
+    return await save_video_bytes_to_output(response.content, prefix="tudou_grok_video_", ext=extension)
+
+async def generate_tudou_grok_video(client, payload, provider, base_url, requested_model):
+    model = selected_model(requested_model, "grok-imagine-video")
+    parts = [(key, (None, str(value))) for key, value in {
+        "model": model, "prompt": str(payload.prompt or ""), "seconds": tudou_grok_video_seconds(payload.duration),
+        "size": tudou_grok_video_size(payload.aspect_ratio or payload.size, payload.resolution),
+        "resolution_name": "480p" if str(payload.resolution or "").lower() == "480p" else "720p", "preset": "custom",
+    }.items()]
+    attached = 0
+    for ref in (payload.images or [])[:7]:
+        part = await tudou_grok_video_part(client, ref)
+        if part:
+            parts.append(part)
+            attached += 1
+    if payload.images and not attached:
+        raise HTTPException(status_code=400, detail="土豆 Grok 图生视频没有成功读取参考图。请使用本地图片、公网图片 URL 或 data:image;base64。")
+    response = await client.post(f"{base_url}/v1/videos", headers=api_headers(json_body=False, provider=provider, model=model), files=parts)
+    response.raise_for_status()
+    try:
+        raw = response.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"土豆 Grok 视频接口返回非 JSON 响应：{(response.text or '')[:500]}") from exc
+    task_id = str(raw.get("id") or extract_task_id(raw) or raw.get("task_id") or "").strip()
+    result = raw if video_output_urls(raw) else await wait_for_video_task(client, provider, task_id, f"{base_url}/v1/videos") if task_id else raw
+    urls = video_output_urls(result)
+    if urls:
+        videos = [await save_remote_video_to_output(url, prefix="tudou_grok_video_") for url in urls]
+    elif task_id:
+        videos = [await download_tudou_grok_video_content(client, provider, base_url, task_id)]
+    else:
+        raise HTTPException(status_code=502, detail=f"土豆 Grok 视频没有返回视频地址：{str(result)[:400]}")
+    return {"videos": videos, "task_id": task_id, "raw": result}
 
 def volcengine_video_prompt_text(prompt, aspect_ratio="", duration=None):
     text = str(prompt or "").strip()

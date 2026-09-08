@@ -2127,6 +2127,7 @@ function applyViewport(){
     shell.style.backgroundSize = '24px 24px';
     shell.style.backgroundPosition = '0 0';
     renderMinimap();
+    scheduleSmartImageResolutionSync(world, 120);
 }
 function screenToWorld(event){
     const rect = shell.getBoundingClientRect();
@@ -2134,13 +2135,6 @@ function screenToWorld(event){
         x:(event.clientX - rect.left - viewport.x) / viewport.scale,
         y:(event.clientY - rect.top - viewport.y) / viewport.scale
     };
-}
-function canvasWheelZoomFactor(event, pageSize){
-    const unit = event.deltaMode === 1 ? 40 : event.deltaMode === 2 ? pageSize : 1;
-    const isMac = /^Mac/.test(navigator.platform || '');
-    const sensitivity = 0.0008;
-    const macMultiplier = isMac ? 1.15 : 1;
-    return Math.exp(-event.deltaY * unit * sensitivity * macMultiplier);
 }
 function viewportCenter(){
     return {
@@ -18289,7 +18283,7 @@ shell.addEventListener('wheel', e => {
     const sx = e.clientX - rect.left;
     const sy = e.clientY - rect.top;
     const before = {x:(sx - viewport.x) / viewport.scale, y:(sy - viewport.y) / viewport.scale};
-    const factor = canvasWheelZoomFactor(e, shell.clientHeight || window.innerHeight || 800);
+    const factor = Math.exp(-e.deltaY * 0.001);
     viewport.scale = safeScale(viewport.scale * factor);
     viewport.x = sx - before.x * viewport.scale;
     viewport.y = sy - before.y * viewport.scale;
